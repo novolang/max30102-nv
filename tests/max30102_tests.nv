@@ -707,6 +707,36 @@ fn test_a_full_fifo_that_lost_samples_drains_all_32_in_seven_bursts() [io, hw]
     test.assert_eq(max30102.lost(d), 0)
 
 @test
+fn test_fifo_read_appends_samples_stamped_back_from_the_last_one() [io, hw]
+    let c = running()
+    let d = dut(c)
+    for i in 0..4
+        fifo_push(c, 200 + i, 700 + i)
+    var out: Vec[PpgSample; 32] = Vec.new()
+    let _ = out.push(PpgSample { red: 1, ir: 2, green: None, at_us: 3 })
+    log_clear(c)
+    test.assert_eq(max30102.fifo_read(d, 4, 2, 3, 10000, 50000, var out), 4)
+    test.assert_eq(out.len(), 5)
+    test.assert_eq(out[0].red, 1)
+    for i in 0..4
+        test.assert_eq(out[i + 1].red, 200 + i)
+        test.assert_eq(out[i + 1].ir, 700 + i)
+        test.assert_eq(out[i + 1].at_us, 50000 - (3 - i) * 10000)
+    log_is(c, [2, 0x07, 24, -1])
+    test.assert_eq(max30102.fifo_read(d, 0, 2, 3, 10000, 50000, var out), 0)
+    test.assert_eq(out.len(), 5)
+
+@test
+fn test_fifo_read_answers_minus_one_when_a_burst_fails() [io, hw]
+    let c = running()
+    let d = dut(c)
+    for i in 0..9
+        fifo_push(c, i, i)
+    c.st.insert(2, 2)
+    var out: Vec[PpgSample; 32] = Vec.new()
+    test.assert_eq(max30102.fifo_read(d, 9, 2, 3, 10000, 50000, var out), -1)
+
+@test
 fn test_the_samples_lost_are_the_overflow_counter() [io, hw]
     let c = running()
     let d = dut(c)

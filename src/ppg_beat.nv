@@ -70,6 +70,7 @@ struct Beat
     beats: Int
     fresh: Bool
 
+// A detector that has seen no sample: not primed, no interval, no rate.
 pub fn beat_new() -> Beat
     Beat { primed: false, dc: 0, lp: 0, amp: 0, armed: false, since: 0, n: 0, i0: 0, i1: 0, i2: 0, i3: 0, bpm: 0, beats: 0, fresh: false }
 
@@ -77,6 +78,8 @@ pub fn beat_new() -> Beat
 pub fn bpm_min() -> Int
     30
 
+// The highest rate the detector reports, 220 beats a minute; a shorter
+// interval is refused as noise.
 pub fn bpm_max() -> Int
     220
 

@@ -172,6 +172,8 @@ pub fn pw_us_of_code(code: Int) -> Int
         return 215
     411
 
+// The ADC resolution in bits for a pulse width code: 15, 16, 17 and 18
+// bits for codes 0 to 3.
 pub fn bits_of_pw_code(code: Int) -> Int
     15 + (code & 3)
 
@@ -186,6 +188,8 @@ pub fn adc_code(na: Int) -> Int
         return 2
     3
 
+// The ADC full scale in nanoamps for a range code: 2048, 4096, 8192 and
+// 16384 for codes 0 to 3.  The inverse of `adc_code` on those values.
 pub fn adc_na_of_code(code: Int) -> Int
     2048 << (code & 3)
 
@@ -209,6 +213,9 @@ pub fn sr_code(hz: Int) -> Int
         return 6
     7
 
+// The sample rate in samples a second for a rate code: 50, 100, 200, 400,
+// 800, 1000, 1600 and 3200 for codes 0 to 7.  The inverse of `sr_code` on
+// those values.
 pub fn sr_of_code(code: Int) -> Int
     if code == 0
         return 50
@@ -343,10 +350,17 @@ pub trait Max30102Port
     fn now_us(self) -> Int [hw]
     fn irq_level(self) -> Int [hw]
 
+// Reads `n` bytes from register `reg` of the part on the I2C bus `bus` at
+// the address in `w` into `dst`, which is emptied first.  Answers false
+// when the part does not acknowledge, when the wiring names no I2C
+// address, or when `n` is more than `dst` can hold.
 pub fn i2c_read_into<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, n: Int,
                                 var dst: DevBytes) -> Bool [hw]
     dev_bus.wiring_read_into(bus, w, reg, n, var dst)
 
+// Writes the bytes of `src` to register `reg` of the part on the I2C bus
+// `bus` at the address in `w`, in one frame.  Answers false when the part
+// does not acknowledge, or when the wiring names no I2C address.
 pub fn i2c_write_from<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, src: DevBytes) -> Bool [hw]
     dev_bus.wiring_write_from(bus, w, reg, src)
 
@@ -365,12 +379,15 @@ pub fn irq_level_of<G: GpioOut>(gpio: G, w: DeviceWiring) -> Int [hw]
 
 // ── Register access ──────────────────────────────────────────────────
 
+// The byte in register `reg`, or `None` when the part did not answer.
 pub fn rd<P: Max30102Port>(p: P, reg: Int) -> ?Int [hw]
     var b: DevBytes = Vec.new()
     if not p.read_regs(reg, 1, var b)
         return None
     Some(b[0] as Int)
 
+// Writes the low eight bits of `v` to register `reg`.  Answers whether the
+// part acknowledged.
 pub fn wr<P: Max30102Port>(p: P, reg: Int, v: Int) -> Bool [hw]
     var src: DevBytes = Vec.new()
     let _ = src.push((v & 0xFF) as u8)
@@ -427,6 +444,8 @@ struct FifoPtrs
     ovf: Int
     rd: Int
 
+// The three FIFO pointers, each masked to its five bits, or `None` when the
+// part did not answer.
 pub fn ptrs_read<P: Max30102Port>(p: P) -> ?FifoPtrs [hw]
     var b: DevBytes = Vec.new()
     if not p.read_regs(FIFO_WR_PTR, 3, var b)
@@ -442,6 +461,8 @@ pub fn available_of(f: FifoPtrs) -> Int
         return FIFO_DEPTH
     n
 
+// The samples waiting in the FIFO, from a read of the pointers, or -1 when
+// the part did not answer.
 pub fn fifo_available<P: Max30102Port>(p: P) -> Int [hw]
     let Some(f) = ptrs_read(p) else return -1
     available_of(f)
@@ -468,6 +489,8 @@ struct CfgBytes
     mode: Int
     spo2: Int
 
+// The FIFO_CONFIG, MODE_CONFIG and SPO2_CONFIG bytes, read in one
+// transaction, or `None` when the part did not answer.
 pub fn cfg_read<P: Max30102Port>(p: P) -> ?CfgBytes [hw]
     var b: DevBytes = Vec.new()
     if not p.read_regs(FIFO_CONFIG, 3, var b)
