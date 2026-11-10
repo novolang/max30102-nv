@@ -29,15 +29,17 @@ sensor on an I2C bus, with a beat detector over its infrared counts.
   count and `beat_run` for a `HeartRate`. A starting point, tested over
   synthesised waveforms.
 - The device program `examples/pulse_reader.nv`, which prints the raw counts
-  and the rate. Built for the nRF52840-DK it is 18,312 B of flash and for
-  the nRF54LM20-DK 19,608 B.
+  and the rate. Built for the nRF52840-DK it is 24,100 B of flash and for
+  the nRF54LM20-DK 25,540 B; before the Nordic buses landed, with the reading
+  path left out, it was 18,312 B and 19,608 B.
 
 ### Known
 
 - Hardware verification: NOT VERIFIED. No board on the bench carries the
-  sensor. Neither Nordic board has a driver for its two-wire interface
-  (TWIM) at this release, so the device program builds for them and finds
-  an absent bus. The beat detector has not seen a wearer's signal.
+  sensor. The nRF52840 DK drives I2C with TWIM0 and the nRF54LM20 DK with
+  TWIM22, so the device program's images carry the reading path; a reply from
+  the sensor over either bus is NOT VERIFIED. The beat detector has not seen a
+  wearer's signal.
 - The data sheet read is document 19-7740 Rev 1 (10/18), the revision that
   could be fetched.
 - `ppg_lost` answers the overflow counter and `at_us` counts on the board's
