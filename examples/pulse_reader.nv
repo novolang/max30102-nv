@@ -1,0 +1,94 @@
+/* pulse_reader.nv: a reading loop that prints the raw red and infrared
+ * counts of a MAX30102 and the heart rate a beat detector finds in them,
+ * once a second
+ *
+ * Build:  bash tests/device_build.sh   (the package's own script)
+ *          or make this file the main of a package that depends on
+ *          max30102-nv and run
+ *              novo build --target=nrf52840-dk src/main.nv
+ * Run:    probe-rs run --chip nRF52840_xxAA main.elf
+ *
+ * NOT a `novo run` program: it targets a board and never ends.
+ *
+ * The sensor is a MAX30102 on a breakout (SparkFun, MikroE Oximeter 5,
+ * the M5Stack heart-rate hat): SDA and SCL to the board's first I2C bus,
+ * the breakout's supply to 3.3 V and its INT pin left open, which this
+ * program does not read.  The part answers at 0x57.  A fingertip rests on
+ * the window, lightly.  A line looks like
+ *
+ *     ir 78234 red 65012 bpm 72
+ *
+ * The program drains the sensor's FIFO ten times a second through
+ * devices-nv's HeartRate trait, prints the newest sample's counts, and
+ * feeds every infrared count to the beat detector of `ppg_beat`, a starting
+ * point and not a medical algorithm.  With no finger on the window the
+ * counts are low and the rate is 0.
+ *
+ * Effects the program declares: [hw], for the I2C bus, the UART and the
+ * timer.  It allocates nothing after it starts.
+ *
+ * Boards: the nRF52840 DK and the nRF54LM20 DK build this program, but
+ * neither board has a driver for its two-wire interface yet (TWIM), so
+ * `BoardI2c` is absent hardware there and the program prints "no answer"
+ * until a board package names one with `@hal(i2c)`.  The sensor has not
+ * been read on a board.
+ */
+use embedded_hal.{ BoardI2c, BoardGpio, BoardTimer }
+use dev_ppg.{ PpgSample, HeartRate }
+use dev_bus
+use max30102.{ Max30102 }
+use ppg_beat
+
+// Writes `n`, 0 or more, in decimal.  Formatting into a string would
+// allocate, which @tier(embedded) refuses, so each digit goes out as a
+// byte.  An Int has at most 19 decimal digits, which bounds both loops.
+@tier(embedded)
+fn digits(n: Int) [hw]
+    var div = 1
+    for _k in 0..18
+        if div <= n / 10
+            div = div * 10
+    for _k in 0..19
+        if div > 0
+            hal.uart.write_byte(48 + (n / div) % 10)
+            div = div / 10
+
+// Writes the line for the newest sample and the detector.
+@tier(embedded)
+fn report(s: PpgSample, bpm: Int) [hw]
+    hal.uart.write("ir ")
+    digits(s.ir)
+    hal.uart.write(" red ")
+    digits(s.red)
+    hal.uart.write(" bpm ")
+    digits(bpm)
+    hal.uart.write("\n")
+
+@tier(embedded)
+fn main() [hw]
+    bsp.board.init()
+    let sensor = Max30102.attach(BoardI2c { id: 0 }, BoardTimer { id: 0 }, BoardGpio { id: 0 },
+                                 dev_bus.wiring_i2c(0, 0x57))
+    // The sensor needs its supplies up; the program waits 20 ms.
+    hal.timer.delay_ms(20)
+    if not sensor.begin()
+        hal.uart.write("no answer from the sensor at 0x57\n")
+    // 100 samples a second reach the detector (400 sps averaged by 4).
+    let cfg = ppg_beat.beat_config_default()
+    var det = ppg_beat.beat_new()
+    var newest = PpgSample { red: 0, ir: 0, green: None, at_us: 0 }
+    var round = 0
+    while true
+        var out: Vec[PpgSample; 32] = Vec.new()
+        let n = sensor.ppg_drain(var out)
+        if n < 0
+            hal.uart.write("no answer\n")
+        else
+            for i in 0..n
+                det = ppg_beat.beat_feed(det, ppg_beat.signal_of(out[i]), cfg)
+                newest = out[i]
+        round = round + 1
+        if round >= 10
+            round = 0
+            report(newest, det.bpm)
+        hal.timer.delay_ms(100)

@@ -1,0 +1,252 @@
+// beat_tests — the beat detector over synthesised waveforms and over a
+// `HeartRate` that serves one.
+//
+// The waveform is a sine at the heart rate on a baseline of 100000 counts,
+// the shape and size of a fingertip signal at a few milliamps (a pulse of
+// under one percent), with a fixed pseudo-random noise added so that a
+// test is repeatable.  No recorded signal from a wearer is used: the
+// detector is a starting point and these tests say what it does on a
+// signal that is easy.  `fs` is 100 samples a second.
+
+use std.test
+use dev_ppg.{ PpgSample, PpgLed, HeartRate }
+use ppg_beat
+use ppg_beat.{ Beat, BeatConfig }
+
+// The next pseudo-random value, 31 bits.
+fn lcg(seed: Int) -> Int
+    (seed * 1103515245 + 12345) & 0x7FFFFFFF
+
+// One sample of a sine of `amp` counts at `bpm` beats a minute, sample `i`
+// at 100 samples a second, on `base` counts with noise of +-`noise`.
+@tier(app)
+fn sample(i: Int, bpm: Int, amp: Int, base: Int, noise: Int, seed: Int) -> Int
+    let phase = 2.0 * math.pi * int.to_float(bpm) / 60.0 * int.to_float(i) / 100.0
+    let s = float.to_int(int.to_float(amp) * math.sin(phase))
+    var n = 0
+    if noise > 0
+        n = (lcg(seed + i * 7919) >> 8) % (2 * noise + 1) - noise
+    base + s + n
+
+// The detector after `secs` seconds of a steady waveform.
+@tier(app)
+fn run(bpm: Int, secs: Int, amp: Int, noise: Int, invert: Bool) -> Beat
+    let c = BeatConfig { fs_hz: 100, invert: invert, min_signal: 20000, min_amp: 20 }
+    var d = ppg_beat.beat_new()
+    for i in 0..(secs * 100)
+        var x = sample(i, bpm, amp, 100000, noise, 17)
+        if invert
+            x = 200000 - x
+        d = ppg_beat.beat_feed(d, x, c)
+    d
+
+fn abs(v: Int) -> Int
+    if v < 0
+        return 0 - v
+    v
+
+// ── The rate ─────────────────────────────────────────────────────────
+
+@test
+fn test_the_rate_is_60_fs_over_the_mean_interval() [io]
+    test.assert_eq(ppg_beat.bpm_of(333, 4, 100), 72)
+    test.assert_eq(ppg_beat.bpm_of(100, 2, 100), 120)
+    test.assert_eq(ppg_beat.bpm_of(200, 2, 100), 60)
+    test.assert_eq(ppg_beat.bpm_of(1000, 1, 100), 0)
+    test.assert_eq(ppg_beat.bpm_of(0, 3, 100), 0)
+    test.assert_eq(ppg_beat.bpm_of(-5, 3, 100), 0)
+    test.assert_eq(ppg_beat.bpm_min(), 30)
+    test.assert_eq(ppg_beat.bpm_max(), 220)
+
+@test
+fn test_a_new_detector_has_no_rate() [io]
+    let d = ppg_beat.beat_new()
+    test.assert_eq(d.bpm, 0)
+    test.assert_eq(d.beats, 0)
+    test.assert(not d.fresh)
+    test.assert(not d.primed)
+    let c = ppg_beat.beat_config_default()
+    test.assert_eq(c.fs_hz, 100)
+    test.assert(not c.invert)
+
+// ── A clean signal ───────────────────────────────────────────────────
+
+@test
+fn test_72_beats_a_minute_on_a_clean_sine() [io]
+    let d = run(72, 30, 800, 0, false)
+    test.assert(abs(d.bpm - 72) <= 1)
+    test.assert(abs(d.beats - 36) <= 2)
+
+@test
+fn test_a_range_of_rates_on_a_clean_sine() [io]
+    for bpm in [45, 60, 90, 120, 150, 180]
+        let d = run(bpm, 30, 800, 0, false)
+        test.assert(abs(d.bpm - bpm) <= 2)
+
+@test
+fn test_noise_of_a_tenth_of_the_pulse_does_not_move_the_rate() [io]
+    let d = run(72, 30, 800, 80, false)
+    test.assert(abs(d.bpm - 72) <= 2)
+    let e = run(100, 30, 800, 80, false)
+    test.assert(abs(e.bpm - 100) <= 2)
+
+@test
+fn test_a_small_pulse_is_found_as_well() [io]
+    let d = run(66, 30, 60, 5, false)
+    test.assert(abs(d.bpm - 66) <= 2)
+
+@test
+fn test_a_sensor_that_sees_the_pulse_as_a_dip_is_read_with_invert() [io]
+    let d = run(84, 30, 800, 20, true)
+    test.assert(abs(d.bpm - 84) <= 2)
+
+// ── A pulse with a second hump ───────────────────────────────────────
+
+@test
+fn test_the_second_hump_of_the_pulse_does_not_count_twice() [io]
+    let c = BeatConfig { fs_hz: 100, invert: false, min_signal: 20000, min_amp: 20 }
+    var d = ppg_beat.beat_new()
+    for i in 0..3000
+        let p1 = 2.0 * math.pi * 1.25 * int.to_float(i) / 100.0
+        let v = 800.0 * math.sin(p1) + 350.0 * math.sin(2.0 * p1 + 1.0)
+        d = ppg_beat.beat_feed(d, 100000 + float.to_int(v), c)
+    test.assert(abs(d.bpm - 75) <= 3)
+
+// ── Gaps, a finger that leaves, a rate that changes ──────────────────
+
+@test
+fn test_the_rate_follows_a_change_of_tempo() [io]
+    let c = ppg_beat.beat_config_default()
+    var d = ppg_beat.beat_new()
+    for i in 0..1500
+        d = ppg_beat.beat_feed(d, sample(i, 60, 800, 100000, 20, 3), c)
+    test.assert(abs(d.bpm - 60) <= 2)
+    for i in 0..1500
+        d = ppg_beat.beat_feed(d, sample(i, 100, 800, 100000, 20, 5), c)
+    test.assert(abs(d.bpm - 100) <= 3)
+
+@test
+fn test_a_flat_signal_has_no_beat() [io]
+    let d = run(72, 10, 0, 0, false)
+    test.assert_eq(d.beats, 0)
+    test.assert_eq(d.bpm, 0)
+
+@test
+fn test_noise_below_the_least_envelope_is_not_a_beat() [io]
+    let d = run(72, 20, 0, 5, false)
+    test.assert_eq(d.beats, 0)
+    test.assert_eq(d.bpm, 0)
+
+@test
+fn test_a_finger_that_leaves_resets_the_detector_and_keeps_the_count() [io]
+    let c = ppg_beat.beat_config_default()
+    var d = run(72, 15, 800, 0, false)
+    let seen = d.beats
+    test.assert(seen > 10)
+    test.assert(d.bpm > 0)
+    d = ppg_beat.beat_feed(d, 5000, c)
+    test.assert_eq(d.bpm, 0)
+    test.assert_eq(d.beats, seen)
+    test.assert(not d.primed)
+    for i in 0..1500
+        d = ppg_beat.beat_feed(d, sample(i, 72, 800, 100000, 0, 1), c)
+    test.assert(abs(d.bpm - 72) <= 2)
+    test.assert(d.beats > seen + 10)
+
+@test
+fn test_three_seconds_without_a_beat_clear_the_rate() [io]
+    let c = ppg_beat.beat_config_default()
+    var d = run(72, 15, 800, 0, false)
+    test.assert(d.bpm > 0)
+    for _i in 0..350
+        d = ppg_beat.beat_feed(d, 100000, c)
+    test.assert_eq(d.bpm, 0)
+
+@test
+fn test_a_long_gap_is_not_taken_for_an_interval() [io]
+    let c = ppg_beat.beat_config_default()
+    var d = run(72, 15, 800, 0, false)
+    for _i in 0..350
+        d = ppg_beat.beat_feed(d, 100000, c)
+    let before = d.beats
+    for i in 0..2000
+        d = ppg_beat.beat_feed(d, sample(i, 72, 800, 100000, 0, 1), c)
+    test.assert(d.beats > before + 10)
+    test.assert(abs(d.bpm - 72) <= 2)
+
+@test
+fn test_a_beat_is_flagged_on_its_own_sample_only() [io]
+    let c = ppg_beat.beat_config_default()
+    var d = ppg_beat.beat_new()
+    var flagged = 0
+    for i in 0..3000
+        d = ppg_beat.beat_feed(d, sample(i, 72, 800, 100000, 0, 1), c)
+        if d.fresh
+            flagged = flagged + 1
+    test.assert_eq(flagged, d.beats)
+
+// ── Over a HeartRate ─────────────────────────────────────────────────
+
+// A `HeartRate` that serves the waveform in chunks of 25 samples, and
+// fails on the call number in `st[9]`.  `st[0]` is the next sample, `st[1]`
+// the calls so far.
+struct FakePpg
+    st: HashMap<Int, Int>
+    bpm: Int
+
+impl HeartRate[hw] for FakePpg
+    fn ppg_set_rate_hz(self, hz: Int) -> Int [hw]
+        hz
+
+    fn ppg_set_led_ma(self, led: PpgLed, ma: Int) -> Int [hw]
+        ma
+
+    @tier(app)
+    fn ppg_drain(self, var out: Vec[PpgSample; 32]) -> Int [hw]
+        out.clear()
+        let calls = (self.st.get(1) ?? 0) + 1
+        self.st.insert(1, calls)
+        if (self.st.get(9) ?? 0) == calls
+            return -1
+        let first = self.st.get(0) ?? 0
+        for k in 0..25
+            let x = sample(first + k, self.bpm, 800, 100000, 20, 11)
+            let _ = out.push(PpgSample { red: x / 2, ir: x, green: None, at_us: (first + k) * 10000 })
+        self.st.insert(0, first + 25)
+        25
+
+    fn ppg_lost(self) -> Int [hw]
+        0
+
+@tier(app)
+fn fake(bpm: Int) -> FakePpg
+    FakePpg { st: HashMap.new(), bpm: bpm }
+
+@test
+fn test_beat_run_drains_and_feeds_every_sample() [io, hw]
+    let p = fake(78)
+    let c = ppg_beat.beat_config_default()
+    var d = ppg_beat.beat_new()
+    for _call in 0..80
+        match ppg_beat.beat_run(p, d, c)
+            Some(next) => d = next
+            None => test.assert(false)
+    test.assert_eq(p.st.get(0) ?? 0, 2000)
+    test.assert(abs(d.bpm - 78) <= 2)
+    test.assert(abs(d.beats - 26) <= 2)
+
+@test
+fn test_beat_run_answers_none_when_the_part_does_not_answer() [io, hw]
+    let p = fake(78)
+    p.st.insert(9, 2)
+    let c = ppg_beat.beat_config_default()
+    let d = ppg_beat.beat_new()
+    test.assert(ppg_beat.beat_run(p, d, c) != None)
+    test.assert(ppg_beat.beat_run(p, d, c) == None)
+
+@test
+fn test_the_detector_reads_red_when_there_is_no_infrared() [io, hw]
+    let a = PpgSample { red: 500, ir: 900, green: None, at_us: 0 }
+    let b = PpgSample { red: 500, ir: 0, green: None, at_us: 0 }
+    test.assert_eq(ppg_beat.signal_of(a), 900)
+    test.assert_eq(ppg_beat.signal_of(b), 500)

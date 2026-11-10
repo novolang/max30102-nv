@@ -1,0 +1,158 @@
+// ppg_beat — a beat detector over a stream of photoplethysmography
+// counts, and the loop that feeds it from a `HeartRate`.
+//
+// This is a starting point, not a certified algorithm.  It finds the
+// heartbeat of a still finger on a good signal and nothing more: it does
+// not reject motion artefacts, does not tell a heartbeat from a tremor,
+// and has not been tried on a wearer.  A product that reports a heart
+// rate to a person needs an algorithm of its own, tuned and validated for
+// its sensor, its LED current and its use.
+//
+// The algorithm, one sample at a time, all in integers:
+//
+//   1. A count below `min_signal` means no finger: the detector resets.
+//   2. The baseline is an exponential average of the counts with a time
+//      constant of 1.5 s (`1.5 x fs` samples), kept 8 bits finer than a
+//      count.  The pulse is the count less the baseline, negated when
+//      `invert` is set: a reflective sensor on a finger sees the light fall
+//      with each pulse of blood, so its pulse is the dip.
+//   3. The pulse is smoothed by an exponential average over 4 samples.
+//   4. An envelope follows the peaks of the smoothed pulse: it jumps up to
+//      a higher value and decays with a time constant of 2 s, and it is
+//      never below `min_amp`.
+//   5. A beat is the smoothed pulse rising through half the envelope.  The
+//      detector is armed again when the pulse falls below a quarter of the
+//      envelope, and a beat is not taken within 250 ms of the last one
+//      (240 beats a minute), which keeps the second hump of a pulse from
+//      counting twice.
+//   6. The interval since the last beat is kept when it is between 30 and
+//      220 beats a minute; the rate is 60 x fs over the mean of the last
+//      four intervals, from the second interval on.  An interval outside
+//      the range, or three seconds without a beat, clears them and the rate
+//      goes to 0.
+//
+// The detector is a value: `beat_feed` takes one and answers the next.
+
+use dev_ppg.{ PpgSample, HeartRate }
+
+// The settings of the detector: the rate of the stream in samples a second,
+// whether the pulse is the dip, the count below which there is no finger,
+// and the smallest envelope.
+pub @value
+struct BeatConfig
+    fs_hz: Int
+    invert: Bool
+    min_signal: Int
+    min_amp: Int
+
+// 100 samples a second, the pulse a peak, no finger below 20000 counts and
+// no envelope below 20.
+pub fn beat_config_default() -> BeatConfig
+    BeatConfig { fs_hz: 100, invert: false, min_signal: 20000, min_amp: 20 }
+
+// The detector's state.  `bpm` is the rate in beats a minute, 0 while
+// there is none; `beats` counts the beats since the detector was made;
+// `fresh` is set on the sample that was a beat.
+pub @value
+struct Beat
+    primed: Bool
+    dc: Int
+    lp: Int
+    amp: Int
+    armed: Bool
+    since: Int
+    n: Int
+    i0: Int
+    i1: Int
+    i2: Int
+    i3: Int
+    bpm: Int
+    beats: Int
+    fresh: Bool
+
+pub fn beat_new() -> Beat
+    Beat { primed: false, dc: 0, lp: 0, amp: 0, armed: false, since: 0, n: 0, i0: 0, i1: 0, i2: 0, i3: 0, bpm: 0, beats: 0, fresh: false }
+
+// The intervals the detector keeps, in beats a minute.
+pub fn bpm_min() -> Int
+    30
+
+pub fn bpm_max() -> Int
+    220
+
+// The rate in beats a minute for `n` intervals summing to `sum` samples at
+// `fs` samples a second, rounded; 0 without two intervals.
+pub fn bpm_of(sum: Int, n: Int, fs: Int) -> Int
+    if n < 2 or sum <= 0
+        return 0
+    (60 * fs * n + sum / 2) / sum
+
+// The detector after one sample.
+pub fn beat_feed(d: Beat, x: Int, c: BeatConfig) -> Beat
+    if x < c.min_signal
+        return Beat { primed: false, dc: 0, lp: 0, amp: 0, armed: false, since: 0, n: 0, i0: 0, i1: 0, i2: 0, i3: 0, bpm: 0, beats: d.beats, fresh: false }
+    var dc = x * 256
+    if d.primed
+        dc = d.dc + (x * 256 - d.dc) / (c.fs_hz * 3 / 2)
+    var s = x - dc / 256
+    if c.invert
+        s = 0 - s
+    let lp = d.lp + (s - d.lp) / 4
+    var amp = d.amp - d.amp / (c.fs_hz * 2)
+    if lp > amp
+        amp = lp
+    if amp < c.min_amp
+        amp = c.min_amp
+    let thr = amp / 2
+    var armed = d.armed
+    var since = d.since + 1
+    var n = d.n
+    var i0 = d.i0
+    var i1 = d.i1
+    var i2 = d.i2
+    var i3 = d.i3
+    var beats = d.beats
+    var fresh = false
+    if lp < thr / 2
+        armed = true
+    elif armed and lp > thr and since >= c.fs_hz / 4
+        fresh = true
+        armed = false
+        if beats > 0
+            let lo = c.fs_hz * 60 / bpm_max()
+            let hi = c.fs_hz * 60 / bpm_min()
+            if since >= lo and since <= hi
+                i3 = i2
+                i2 = i1
+                i1 = i0
+                i0 = since
+                if n < 4
+                    n = n + 1
+            else
+                n = 0
+        beats = beats + 1
+        since = 0
+    var bpm = bpm_of(i0 + i1 + i2 + i3, n, c.fs_hz)
+    if since > c.fs_hz * 3
+        n = 0
+        bpm = 0
+    Beat { primed: true, dc: dc, lp: lp, amp: amp, armed: armed, since: since, n: n, i0: i0, i1: i1, i2: i2, i3: i3, bpm: bpm, beats: beats, fresh: fresh }
+
+// The count the detector reads from a sample: the infrared count, or the
+// red one for a part in heart rate mode, which has no infrared.
+pub fn signal_of(s: PpgSample) -> Int
+    if s.ir != 0
+        return s.ir
+    s.red
+
+// Drains a `HeartRate` and feeds every sample it holds to the detector:
+// the detector after them, or `None` when the part did not answer.
+pub fn beat_run<H: HeartRate>(h: H, d: Beat, c: BeatConfig) -> ?Beat [hw]
+    var out: Vec[PpgSample; 32] = Vec.new()
+    let got = h.ppg_drain(var out)
+    if got < 0
+        return None
+    var cur = d
+    for i in 0..got
+        cur = beat_feed(cur, signal_of(out[i]), c)
+    Some(cur)

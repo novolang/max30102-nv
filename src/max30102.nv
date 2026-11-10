@@ -1,0 +1,745 @@
+// max30102 — Maxim's (now Analog Devices') MAX30102 pulse oximeter and
+// heart-rate sensor, on its I2C bus, as devices-nv's `HeartRate` and
+// `Identifiable`.
+//
+// The facts below are from the data sheet "MAX30102: High-Sensitivity
+// Pulse Oximeter and Heart-Rate Sensor for Wearable Health", document
+// 19-7740, Rev 1, 10/18 (the copy that could be fetched; its register map
+// and tables are named by number).  Where the sheet and the drivers read
+// for this one disagree, the site says which was taken.
+//
+// The part has two LEDs, red (660 nm) and infrared (880 nm), and a
+// photodiode with an 18-bit ADC.  It has a 32-sample FIFO, a die
+// temperature sensor and an active-low interrupt pin.  It answers on the
+// I2C address 0x57 (the sheet writes 0xAE / 0xAF).  The register map (§
+// "Register Maps and Descriptions"), as this driver uses it:
+//
+//   0x00  INT_STATUS_1     A_FULL (7), PPG_RDY (6), ALC_OVF (5), PWR_RDY (0)
+//   0x01  INT_STATUS_2     DIE_TEMP_RDY (1)
+//   0x02  INT_ENABLE_1     A_FULL_EN (7), PPG_RDY_EN (6), ALC_OVF_EN (5)
+//   0x03  INT_ENABLE_2     DIE_TEMP_RDY_EN (1)
+//   0x04  FIFO_WR_PTR      bits 4:0
+//   0x05  OVF_COUNTER      bits 4:0, saturates at 31
+//   0x06  FIFO_RD_PTR      bits 4:0
+//   0x07  FIFO_DATA        a read does not advance the register address
+//   0x08  FIFO_CONFIG      SMP_AVE (7:5), FIFO_ROLLOVER_EN (4), FIFO_A_FULL (3:0)
+//   0x09  MODE_CONFIG      SHDN (7), RESET (6), MODE (2:0): 010 heart rate
+//                          (red only), 011 SpO2 (red and IR), 111 multi-LED
+//   0x0A  SPO2_CONFIG      SPO2_ADC_RGE (6:5), SPO2_SR (4:2), LED_PW (1:0)
+//   0x0C  LED1_PA          red pulse amplitude, 0.2 mA a step
+//   0x0D  LED2_PA          infrared pulse amplitude
+//   0x1F  DIE_TEMP_INT     two's complement, 1 degree C a step
+//   0x20  DIE_TEMP_FRAC    bits 3:0, 0.0625 degree C a step
+//   0x21  DIE_TEMP_CONFIG  TEMP_EN (0), self-clearing
+//   0xFE  REV_ID           the part's revision
+//   0xFF  PART_ID          0x15
+//
+// The FIFO.  A sample is one 3-byte count per active channel, red first,
+// the 18-bit ADC word LEFT-justified in the 24 bits (Table 1): the most
+// significant ADC bit is always bit 17, whatever the resolution, so a
+// 15-bit conversion (69 us pulse) leaves bits 2:0 at zero.  Reading
+// FIFO_DATA does not advance the register address, so one burst read of
+// 0x07 returns the bytes of consecutive samples; the read pointer advances
+// itself.  Every other register burst-reads upwards, and a burst that
+// crosses 0x07 pops a sample from the FIFO: the pointer registers 0x04 to
+// 0x06 and the configuration registers 0x08 to 0x0A are read separately.
+//
+// Drivers read for their fixes, nothing ported: Zephyr's
+// `drivers/sensor/maxim/max30101` and the `max3010x` crate (eldruin).
+//
+//   - The crate counts the samples as `wr - rd` modulo 32, which reads a
+//     FIFO that is exactly full as empty: with roll-over off a full FIFO
+//     stops taking samples, `wr` meets `rd`, and the crate never drains it.
+//     The overflow counter tells the two apart, and `fifo_available`
+//     answers 32 when the pointers meet and samples have been lost.
+//   - Zephyr reads one sample per fetch without looking at the pointers,
+//     so it reads stale bytes from an empty FIFO.  Here the count comes
+//     first and a read never asks for more than the FIFO holds.
+//   - Both shift the count right by the resolution's missing bits; so
+//     does this driver, so a count is the ADC's own value (15 to 18 bits)
+//     and counts at two pulse widths are not the same scale.
+//   - The interrupt pin is held low after power-up by PWR_RDY until
+//     INT_STATUS_1 is read; `start` reads both status registers last.
+//   - RESET clears itself when the part is done and raises no PWR_RDY; the
+//     driver waits for the bit to clear.
+//   - A burst read that fails half-way leaves FIFO_RD_PTR advanced; the
+//     driver writes the pointer back so the samples can be read again, as
+//     the sheet's third transaction says.
+//
+// The sample rate is limited by the pulse width (Tables 11 and 12), and the
+// part programs the highest rate allowed when a higher one is asked for.
+// The driver clamps first and reads the register back, so the rate it
+// reports is the part's.
+
+use embedded_hal.{ BoardI2c, BoardGpio, BoardTimer, I2cBus, GpioOut, Timer }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_ppg.{ PpgSample, PpgLed, HeartRate }
+use dev_id.{ DeviceId, Identifiable }
+
+// The registers.
+let INT_STATUS_1 = 0x00
+let INT_ENABLE_1 = 0x02
+let FIFO_WR_PTR = 0x04
+let FIFO_DATA = 0x07
+let FIFO_CONFIG = 0x08
+let MODE_CONFIG = 0x09
+let SPO2_CONFIG = 0x0A
+let LED1_PA = 0x0C
+let LED2_PA = 0x0D
+let DIE_TEMP_INT = 0x1F
+let DIE_TEMP_CONFIG = 0x21
+let REV_ID = 0xFE
+let PART_ID = 0xFF
+
+// PART_ID's value.
+let ID_MAX30102 = 0x15
+
+// MODE_CONFIG: shutdown, reset, and the modes.
+let MODE_SHDN = 0x80
+let MODE_RESET = 0x40
+let MODE_HR = 0x02
+let MODE_SPO2 = 0x03
+
+// FIFO_CONFIG: roll-over.
+let FIFO_ROLLOVER = 0x10
+
+// Interrupt bits: INT_STATUS_1 / INT_ENABLE_1 and the second register,
+// which `int_status` puts in the low byte.
+let INT_A_FULL = 0x8000
+let INT_PPG_RDY = 0x4000
+let INT_ALC_OVF = 0x2000
+let INT_PWR_RDY = 0x0100
+let INT_DIE_TEMP = 0x0002
+
+// The FIFO holds 32 samples.
+let FIFO_DEPTH = 32
+
+// The bus clock, I2C fast mode, and how long the driver waits: for the
+// reset bit and for a temperature conversion (the sheet's Figure 4 shows
+// 29 ms), in milliseconds.
+let I2C_HZ = 400000
+let RESET_WAIT_MS = 100
+let TEMP_WAIT_MS = 100
+
+// The LED current is 0.2 mA a step, 0xFF being 51.0 mA (Table 8).
+let LED_STEP_TENTHS_MA = 2
+let LED_CODE_MAX = 255
+
+// A beat detector's sample is the infrared count when there is one.
+let SAMPLE_BYTES = 3
+
+// ── Conversions ──────────────────────────────────────────────────────
+
+// The averaging code for a count of samples averaged per FIFO sample
+// (Table 3): the least of 1, 2, 4, 8, 16 and 32 that is at least `n`.
+pub fn avg_code(n: Int) -> Int
+    if n <= 1
+        return 0
+    if n <= 2
+        return 1
+    if n <= 4
+        return 2
+    if n <= 8
+        return 3
+    if n <= 16
+        return 4
+    5
+
+// The count for a code; codes 5 to 7 are all 32.
+pub fn avg_of_code(code: Int) -> Int
+    if code >= 5
+        return 32
+    1 << code
+
+// The pulse-width code for a width in microseconds (Table 7): the least
+// of 69, 118, 215 and 411 that is at least `us`.
+pub fn pw_code(us: Int) -> Int
+    if us <= 69
+        return 0
+    if us <= 118
+        return 1
+    if us <= 215
+        return 2
+    3
+
+// The width in microseconds for a code, and the ADC resolution in bits.
+pub fn pw_us_of_code(code: Int) -> Int
+    if code == 0
+        return 69
+    if code == 1
+        return 118
+    if code == 2
+        return 215
+    411
+
+pub fn bits_of_pw_code(code: Int) -> Int
+    15 + (code & 3)
+
+// The ADC range code for a full scale in nanoamps (Table 5): the least
+// of 2048, 4096, 8192 and 16384 that is at least `na`.
+pub fn adc_code(na: Int) -> Int
+    if na <= 2048
+        return 0
+    if na <= 4096
+        return 1
+    if na <= 8192
+        return 2
+    3
+
+pub fn adc_na_of_code(code: Int) -> Int
+    2048 << (code & 3)
+
+// The sample-rate code for a rate in samples a second (Table 6): the
+// least of 50, 100, 200, 400, 800, 1000, 1600 and 3200 that is at least
+// `hz`.
+pub fn sr_code(hz: Int) -> Int
+    if hz <= 50
+        return 0
+    if hz <= 100
+        return 1
+    if hz <= 200
+        return 2
+    if hz <= 400
+        return 3
+    if hz <= 800
+        return 4
+    if hz <= 1000
+        return 5
+    if hz <= 1600
+        return 6
+    7
+
+pub fn sr_of_code(code: Int) -> Int
+    if code == 0
+        return 50
+    if code == 1
+        return 100
+    if code == 2
+        return 200
+    if code == 3
+        return 400
+    if code == 4
+        return 800
+    if code == 5
+        return 1000
+    if code == 6
+        return 1600
+    3200
+
+// The highest rate code a pulse width allows (Tables 11 and 12): in SpO2
+// mode 1600, 1000, 800 and 400 sps for 69, 118, 215 and 411 us, in heart
+// rate mode 3200, 1600, 1600 and 1000 sps.
+pub fn sr_code_max(pw: Int, spo2: Bool) -> Int
+    if spo2
+        if pw == 0
+            return 6
+        if pw == 1
+            return 5
+        if pw == 2
+            return 4
+        return 3
+    if pw == 0
+        return 7
+    if pw == 3
+        return 5
+    6
+
+// The rate code to program for a wish: the least code at or above `hz`
+// that the pulse width allows, or the highest it allows.
+pub fn sr_code_for(hz: Int, pw: Int, spo2: Bool) -> Int
+    let want = sr_code(hz)
+    let top = sr_code_max(pw, spo2)
+    if want > top
+        return top
+    want
+
+// The LED current register for a current in milliamps: the largest step
+// at or below it, never above, 0 for a current that is not positive.
+pub fn led_code_of_ma(ma: Int) -> Int
+    if ma <= 0
+        return 0
+    let c = ma * 10 / LED_STEP_TENTHS_MA
+    if c > LED_CODE_MAX
+        return LED_CODE_MAX
+    c
+
+// The current a register value sets, in whole milliamps, rounded down.
+pub fn ma_of_led_code(code: Int) -> Int
+    (code & 0xFF) * LED_STEP_TENTHS_MA / 10
+
+// The die temperature in thousandths of a degree Celsius from the two
+// registers: the integer in two's complement plus the fraction in 1/16
+// degree, added even when the integer is negative (the sheet: -128 + 0.5
+// is -127.5).
+pub fn temp_milli_c_of(tint: Int, tfrac: Int) -> Int
+    dev_bus.dev_sign_extend(tint, 8) * 1000 + (tfrac & 0x0F) * 625 / 10
+
+// The count three FIFO bytes mean at a pulse-width code: the 24-bit word
+// of three bytes, most significant first, masked to its 18 bits, shifted
+// right by the bits the resolution leaves at zero.
+pub fn count_of_bytes(hi: Int, mid: Int, lo: Int, pw: Int) -> Int
+    dev_ppg.ppg_count_of_bytes(hi, mid, lo, 18) >> (18 - bits_of_pw_code(pw))
+
+// ── The configuration ────────────────────────────────────────────────
+
+// What `configure` writes.  `spo2` selects SpO2 mode (red and infrared)
+// over heart rate mode (red only).  `averaging` is the samples averaged
+// per FIFO sample, `rate_sps` the rate of the ADC before averaging, so
+// the FIFO fills at `rate_sps / averaging`.  `full_empty` is
+// FIFO_A_FULL: the empty slots left when the almost-full interrupt fires,
+// 0 to 15.  `red_pa` and `ir_pa` are the raw pulse amplitudes.
+pub @value
+struct Max30102Config
+    spo2: Bool
+    averaging: Int
+    rollover: Bool
+    full_empty: Int
+    rate_sps: Int
+    pulse_us: Int
+    adc_na: Int
+    red_pa: Int
+    ir_pa: Int
+
+// The configuration `start` uses: SpO2 mode, 4 samples averaged at 400
+// sps so the FIFO fills at 100 sps, roll-over off so an overrun shows in
+// the overflow counter, the interrupt with 10 slots left (22 unread), the
+// 411 us pulse (18 bits), 4096 nA full scale and about 6 mA in both LEDs.
+pub fn config_default() -> Max30102Config
+    Max30102Config { spo2: true, averaging: 4, rollover: false, full_empty: 10, rate_sps: 400, pulse_us: 411, adc_na: 4096, red_pa: 0x1F, ir_pa: 0x1F }
+
+// The FIFO_CONFIG byte for a configuration.
+pub fn fifo_config_of(c: Max30102Config) -> Int
+    var v = (avg_code(c.averaging) << 5) | (c.full_empty & 0x0F)
+    if c.rollover
+        v = v | FIFO_ROLLOVER
+    v
+
+// The SPO2_CONFIG byte for a configuration; the rate is clamped to what
+// the pulse width allows.
+pub fn spo2_config_of(c: Max30102Config) -> Int
+    let pw = pw_code(c.pulse_us)
+    (adc_code(c.adc_na) << 5) | (sr_code_for(c.rate_sps, pw, c.spo2) << 2) | pw
+
+// The rate in samples a second the FIFO fills at, from the FIFO_CONFIG
+// and SPO2_CONFIG bytes: the ADC rate over the averaging.
+pub fn fifo_rate_of(fifo_cfg: Int, spo2_cfg: Int) -> Int
+    sr_of_code((spo2_cfg >> 2) & 7) / avg_of_code((fifo_cfg >> 5) & 7)
+
+// The time between FIFO samples in microseconds.
+pub fn period_us_of(fifo_cfg: Int, spo2_cfg: Int) -> Int
+    let r = fifo_rate_of(fifo_cfg, spo2_cfg)
+    1000000 / r
+
+// ── The bus ──────────────────────────────────────────────────────────
+
+// A bus the part is on: `setup` makes it ready, `read_regs` and
+// `write_regs` move bytes in one transaction, `now_us` is the board's
+// microsecond tick, which times the waits and stamps the samples, and
+// `irq_level` is the level of INT.
+pub trait Max30102Port
+    fn setup(self) -> Bool [hw]
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+    fn write_regs(self, reg: Int, src: DevBytes) -> Bool [hw]
+    fn now_us(self) -> Int [hw]
+    fn irq_level(self) -> Int [hw]
+
+pub fn i2c_read_into<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, n: Int,
+                                var dst: DevBytes) -> Bool [hw]
+    dev_bus.wiring_read_into(bus, w, reg, n, var dst)
+
+pub fn i2c_write_from<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, src: DevBytes) -> Bool [hw]
+    dev_bus.wiring_write_from(bus, w, reg, src)
+
+// Makes the bus ready: the interrupt pin an input with the bus at 400 kHz.
+// Answers whether the wiring has an address.
+pub fn i2c_setup<B: I2cBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring) -> Bool [hw]
+    if let Some(irq) = w.irq
+        gpio.mode(irq, 0)
+    bus.init(I2C_HZ)
+    w.addr != None
+
+// The level of INT on the board, or -1 for a wiring with no interrupt pin.
+pub fn irq_level_of<G: GpioOut>(gpio: G, w: DeviceWiring) -> Int [hw]
+    let Some(irq) = w.irq else return -1
+    gpio.get(irq)
+
+// ── Register access ──────────────────────────────────────────────────
+
+pub fn rd<P: Max30102Port>(p: P, reg: Int) -> ?Int [hw]
+    var b: DevBytes = Vec.new()
+    if not p.read_regs(reg, 1, var b)
+        return None
+    Some(b[0] as Int)
+
+pub fn wr<P: Max30102Port>(p: P, reg: Int, v: Int) -> Bool [hw]
+    var src: DevBytes = Vec.new()
+    let _ = src.push((v & 0xFF) as u8)
+    p.write_regs(reg, src)
+
+// Sets the bits of `mask` in `reg` to `bits`, leaving the others.
+pub fn upd<P: Max30102Port>(p: P, reg: Int, mask: Int, bits: Int) -> Bool [hw]
+    let Some(old) = rd(p, reg) else return false
+    wr(p, reg, (old & (0xFF ^ mask)) | (bits & mask))
+
+// ── Identity, reset and shutdown ─────────────────────────────────────
+
+// Whether PART_ID reads 0x15.
+pub fn part_ok<P: Max30102Port>(p: P) -> Bool [hw]
+    rd(p, PART_ID) == Some(ID_MAX30102)
+
+// The part's identity: PART_ID and REV_ID (the sheet gives the revision as
+// a number the maker assigns).
+pub fn id_read<P: Max30102Port>(p: P) -> ?DeviceId [hw]
+    let Some(who) = rd(p, PART_ID) else return None
+    if who != ID_MAX30102
+        return None
+    Some(DeviceId { who: who, rev: rd(p, REV_ID) })
+
+// Resets the part: RESET set in MODE_CONFIG, then waited for until the
+// part has cleared it, at most 100 ms.  Every register is back at its
+// power-on value afterwards, and no PWR_RDY interrupt is raised.
+pub fn reset<P: Max30102Port>(p: P) -> Bool [hw]
+    if not wr(p, MODE_CONFIG, MODE_RESET)
+        return false
+    let start = p.now_us()
+    loop
+        let Some(v) = rd(p, MODE_CONFIG) else return false
+        if (v & MODE_RESET) == 0
+            return true
+        if p.now_us() - start >= RESET_WAIT_MS * 1000
+            return false
+
+// Puts the part in shutdown, where the registers keep their values and the
+// interrupts clear, or wakes it.
+pub fn shutdown<P: Max30102Port>(p: P, on: Bool) -> Bool [hw]
+    var v = 0
+    if on
+        v = MODE_SHDN
+    upd(p, MODE_CONFIG, MODE_SHDN, v)
+
+// ── The FIFO ─────────────────────────────────────────────────────────
+
+// The write pointer, overflow counter and read pointer, read together:
+// three bytes from FIFO_WR_PTR, which stop before FIFO_DATA.
+pub @value
+struct FifoPtrs
+    wr: Int
+    ovf: Int
+    rd: Int
+
+pub fn ptrs_read<P: Max30102Port>(p: P) -> ?FifoPtrs [hw]
+    var b: DevBytes = Vec.new()
+    if not p.read_regs(FIFO_WR_PTR, 3, var b)
+        return None
+    Some(FifoPtrs { wr: (b[0] as Int) & 0x1F, ovf: (b[1] as Int) & 0x1F, rd: (b[2] as Int) & 0x1F })
+
+// The samples waiting: the pointers' difference modulo 32.  When the
+// pointers meet, the FIFO is empty unless samples were lost, in which case
+// it is full.
+pub fn available_of(f: FifoPtrs) -> Int
+    let n = (f.wr - f.rd) & 0x1F
+    if n == 0 and f.ovf > 0
+        return FIFO_DEPTH
+    n
+
+pub fn fifo_available<P: Max30102Port>(p: P) -> Int [hw]
+    let Some(f) = ptrs_read(p) else return -1
+    available_of(f)
+
+// Empties the FIFO: the write pointer, the overflow counter and the read
+// pointer to zero, in one write.  The sheet advises it when a measurement
+// starts, and changing the mode does not do it.
+pub fn fifo_clear<P: Max30102Port>(p: P) -> Bool [hw]
+    var src: DevBytes = Vec.new()
+    let _ = src.push(0 as u8)
+    let _ = src.push(0 as u8)
+    let _ = src.push(0 as u8)
+    p.write_regs(FIFO_WR_PTR, src)
+
+// Puts the read pointer back, so that samples can be read again.
+pub fn rd_ptr_set<P: Max30102Port>(p: P, v: Int) -> Bool [hw]
+    wr(p, FIFO_WR_PTR + 2, v & 0x1F)
+
+// The configuration the part is in, as the three bytes FIFO_CONFIG,
+// MODE_CONFIG and SPO2_CONFIG.
+pub @value
+struct CfgBytes
+    fifo: Int
+    mode: Int
+    spo2: Int
+
+pub fn cfg_read<P: Max30102Port>(p: P) -> ?CfgBytes [hw]
+    var b: DevBytes = Vec.new()
+    if not p.read_regs(FIFO_CONFIG, 3, var b)
+        return None
+    Some(CfgBytes { fifo: b[0] as Int, mode: b[1] as Int, spo2: b[2] as Int })
+
+// Whether a MODE_CONFIG byte is in SpO2 mode, with two channels a sample.
+pub fn channels_of(mode: Int) -> Int
+    if (mode & 7) == MODE_SPO2 or (mode & 7) == 7
+        return 2
+    1
+
+// Reads up to `n` samples of `ch` channels from FIFO_DATA, at the pulse
+// width code `pw`, into `out` after its present contents.  The read goes
+// in bursts of at most 30 bytes, which is what a `DevBytes` holds and is a
+// whole number of samples.  `at_us` of the last sample read is `last_us`,
+// each earlier one a period before.  Answers the samples read, or -1 when
+// a burst failed.
+pub fn fifo_read<P: Max30102Port>(p: P, n: Int, ch: Int, pw: Int, period_us: Int, last_us: Int,
+                                  var out: Vec[PpgSample; 32]) -> Int [hw]
+    let per = 30 / (ch * SAMPLE_BYTES)
+    var done = 0
+    for _burst in 0..FIFO_DEPTH
+        if done < n
+            var take = n - done
+            if take > per
+                take = per
+            var b: DevBytes = Vec.new()
+            if not p.read_regs(FIFO_DATA, take * ch * SAMPLE_BYTES, var b)
+                return -1
+            for s in 0..take
+                let base = s * ch * SAMPLE_BYTES
+                let red = count_of_bytes(b[base] as Int, b[base + 1] as Int, b[base + 2] as Int, pw)
+                var ir = 0
+                if ch == 2
+                    ir = count_of_bytes(b[base + 3] as Int, b[base + 4] as Int, b[base + 5] as Int, pw)
+                let _ = out.push(PpgSample { red: red, ir: ir, green: None, at_us: last_us - (n - 1 - (done + s)) * period_us })
+            done = done + take
+    done
+
+// Drains the FIFO: replaces `out` with the samples waiting, oldest first,
+// and answers how many; 0 for an empty FIFO and -1 when the part did not
+// answer.  The pointers are read first and the samples after, so a read
+// never asks for more than the FIFO held.  If a burst fails the read
+// pointer is put back where it was, so the samples are not lost to the
+// next drain.
+//
+// The part carries no time stamps.  The newest sample is stamped with the
+// board's microsecond tick at the drain, and each older one a FIFO period
+// before it, so a stamp is within one period of the instant the sample
+// was taken.
+pub fn drain<P: Max30102Port>(p: P, var out: Vec[PpgSample; 32]) -> Int [hw]
+    out.clear()
+    let Some(f) = ptrs_read(p) else return -1
+    let n = available_of(f)
+    if n == 0
+        return 0
+    let Some(c) = cfg_read(p) else return -1
+    let now = p.now_us()
+    let pw = c.spo2 & 3
+    let got = fifo_read(p, n, channels_of(c.mode), pw, period_us_of(c.fifo, c.spo2), now, var out)
+    if got < 0
+        out.clear()
+        let _ = rd_ptr_set(p, f.rd)
+        return -1
+    got
+
+// The samples the FIFO has lost since it was last read: the overflow
+// counter, which saturates at 31 and is cleared when a sample is read.
+// The sheet gives no count since sampling started; the driver keeps no
+// state to add it up.
+pub fn lost<P: Max30102Port>(p: P) -> Int [hw]
+    let Some(f) = ptrs_read(p) else return 0
+    f.ovf
+
+// ── The settings ─────────────────────────────────────────────────────
+
+// Sets an LED's current to the largest step at or below `ma`: the
+// current set in whole milliamps, 0 for the LED the part does not have
+// (green) and when the part did not take the write.
+pub fn led_set<P: Max30102Port>(p: P, led: PpgLed, ma: Int) -> Int [hw]
+    var reg = LED1_PA
+    match led
+        PpgLed.PpgRed => reg = LED1_PA
+        PpgLed.PpgIr => reg = LED2_PA
+        PpgLed.PpgGreen => return 0
+    let code = led_code_of_ma(ma)
+    if not wr(p, reg, code)
+        return 0
+    ma_of_led_code(code)
+
+// Sets the rate the FIFO fills at to the least the part has at or above
+// `hz`, with the averaging that is set, and the pulse width and mode kept:
+// the rate the part took, in samples a second, or 0 when it did not
+// answer.  The ADC rate asked of the part is `hz` times the averaging,
+// clamped to what the pulse width allows, and the register is read back.
+pub fn rate_set<P: Max30102Port>(p: P, hz: Int) -> Int [hw]
+    let Some(c) = cfg_read(p) else return 0
+    let avg = avg_of_code((c.fifo >> 5) & 7)
+    let pw = c.spo2 & 3
+    let spo2 = channels_of(c.mode) == 2
+    let code = sr_code_for(hz * avg, pw, spo2)
+    let v = (c.spo2 & 0x63) | (code << 2)
+    if not wr(p, SPO2_CONFIG, v)
+        return 0
+    let Some(back) = rd(p, SPO2_CONFIG) else return 0
+    fifo_rate_of(c.fifo, back)
+
+// The interrupts to enable, as a mask of `INT_A_FULL`, `INT_PPG_RDY`,
+// `INT_ALC_OVF` (the high byte, INT_ENABLE_1) and `INT_DIE_TEMP` (the low
+// byte, INT_ENABLE_2).
+pub fn int_enable<P: Max30102Port>(p: P, mask: Int) -> Bool [hw]
+    var src: DevBytes = Vec.new()
+    let _ = src.push(((mask >> 8) & 0xE0) as u8)
+    let _ = src.push((mask & 0x02) as u8)
+    p.write_regs(INT_ENABLE_1, src)
+
+// Both interrupt status registers in one read, INT_STATUS_1 in the high
+// byte; the read clears them and releases INT.  -1 when the part did not
+// answer.
+pub fn int_status<P: Max30102Port>(p: P) -> Int [hw]
+    var b: DevBytes = Vec.new()
+    if not p.read_regs(INT_STATUS_1, 2, var b)
+        return -1
+    ((b[0] as Int) << 8) | (b[1] as Int)
+
+// ── The temperature ──────────────────────────────────────────────────
+
+// Takes one die temperature reading in thousandths of a degree Celsius:
+// TEMP_EN is set, waited for until the part clears it (at most 100 ms),
+// and the integer and fraction are read in that order.  The sheet says
+// both registers are read together; reading the fraction clears
+// DIE_TEMP_RDY.  `None` when the part did not answer or did not finish.
+pub fn temperature<P: Max30102Port>(p: P) -> ?Int [hw]
+    if not wr(p, DIE_TEMP_CONFIG, 0x01)
+        return None
+    let start = p.now_us()
+    loop
+        let Some(v) = rd(p, DIE_TEMP_CONFIG) else return None
+        if (v & 0x01) == 0
+            break
+        if p.now_us() - start >= TEMP_WAIT_MS * 1000
+            return None
+    var b: DevBytes = Vec.new()
+    if not p.read_regs(DIE_TEMP_INT, 2, var b)
+        return None
+    Some(temp_milli_c_of(b[0] as Int, b[1] as Int))
+
+// ── The bring-up ─────────────────────────────────────────────────────
+
+// Writes a configuration: the FIFO, the SpO2 settings and the two LED
+// currents, then the FIFO is emptied, and last the mode, which starts the
+// sampling.  Answers whether the part took every write.
+pub fn configure<P: Max30102Port>(p: P, c: Max30102Config) -> Bool [hw]
+    var mode = MODE_HR
+    if c.spo2
+        mode = MODE_SPO2
+    wr(p, FIFO_CONFIG, fifo_config_of(c)) and wr(p, SPO2_CONFIG, spo2_config_of(c)) and wr(p, LED1_PA, c.red_pa) and wr(p, LED2_PA, c.ir_pa) and fifo_clear(p) and wr(p, MODE_CONFIG, mode)
+
+// Brings the part up: the bus made ready, PART_ID checked, the part reset,
+// the configuration written, the interrupts disabled, and both status
+// registers read so that INT is released.  Answers whether the part
+// answered as a MAX30102 and took every setting.
+pub fn start<P: Max30102Port>(p: P, c: Max30102Config) -> Bool [hw]
+    if not p.setup()
+        return false
+    if not part_ok(p)
+        return false
+    if not reset(p)
+        return false
+    if not (int_enable(p, 0) and configure(p, c))
+        return false
+    int_status(p) >= 0
+
+// ── The part on a board's I2C bus ────────────────────────────────────
+
+// A MAX30102 on a board's I2C bus at the address `w.addr`, 0x57, with the
+// board's timer for the stamps and the board's GPIO for the interrupt
+// line.  The value holds no state, so every method takes a plain `self`.
+pub @value
+struct Max30102
+    bus: BoardI2c
+    timer: BoardTimer
+    pins: BoardGpio
+    w: DeviceWiring
+
+impl Max30102Port for Max30102
+    fn setup(self) -> Bool [hw]
+        i2c_setup(self.bus, self.pins, self.w)
+
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        i2c_read_into(self.bus, self.w, reg, n, var dst)
+
+    fn write_regs(self, reg: Int, src: DevBytes) -> Bool [hw]
+        i2c_write_from(self.bus, self.w, reg, src)
+
+    fn now_us(self) -> Int [hw]
+        self.timer.ticks_us()
+
+    fn irq_level(self) -> Int [hw]
+        irq_level_of(self.pins, self.w)
+
+impl Max30102
+    // The part at `w.addr` on the board's I2C bus, as a board's device
+    // table builds it.  Nothing is sent.
+    fn attach(bus: BoardI2c, timer: BoardTimer, pins: BoardGpio, w: DeviceWiring) -> Max30102
+        Max30102 { bus: bus, timer: timer, pins: pins, w: w }
+
+    // Brings the part up with `config_default` (`start`).
+    fn begin(self) -> Bool [hw]
+        start(self, config_default())
+
+    // Brings the part up with a configuration of the caller's.
+    fn begin_with(self, c: Max30102Config) -> Bool [hw]
+        start(self, c)
+
+    // One register's byte, `None` when the part did not answer.
+    fn reg(self, r: Int) -> ?Int [hw]
+        rd(self, r)
+
+    // Writes a register, for the bits this driver does not name.
+    fn set_reg(self, r: Int, v: Int) -> Bool [hw]
+        wr(self, r, v)
+
+    // Power-save mode on or off; the registers keep their values.
+    fn shutdown(self, on: Bool) -> Bool [hw]
+        shutdown(self, on)
+
+    // Empties the FIFO.
+    fn clear_fifo(self) -> Bool [hw]
+        fifo_clear(self)
+
+    // The samples waiting in the FIFO, -1 when the part did not answer.
+    fn fifo_count(self) -> Int [hw]
+        fifo_available(self)
+
+    // Sets the empty slots left when the almost-full interrupt fires, 0 to
+    // 15, and leaves the other bits of FIFO_CONFIG.
+    fn set_almost_full(self, empty: Int) -> Bool [hw]
+        upd(self, FIFO_CONFIG, 0x0F, empty)
+
+    // Enables the interrupts of a mask of the `INT_` bits.
+    fn interrupts_enable(self, mask: Int) -> Bool [hw]
+        int_enable(self, mask)
+
+    // Reads and clears the interrupt flags, -1 when the part did not
+    // answer.
+    fn interrupts_read(self) -> Int [hw]
+        int_status(self)
+
+    // The die temperature in thousandths of a degree Celsius.
+    fn temperature_milli_c(self) -> ?Int [hw]
+        temperature(self)
+
+    // The level of INT, -1 without a pin in the wiring.
+    fn int_level(self) -> Int [hw]
+        self.irq_level()
+
+impl HeartRate[hw] for Max30102
+    fn ppg_set_rate_hz(self, hz: Int) -> Int [hw]
+        rate_set(self, hz)
+
+    fn ppg_set_led_ma(self, led: PpgLed, ma: Int) -> Int [hw]
+        led_set(self, led, ma)
+
+    fn ppg_drain(self, var out: Vec[PpgSample; 32]) -> Int [hw]
+        drain(self, var out)
+
+    fn ppg_lost(self) -> Int [hw]
+        lost(self)
+
+impl Identifiable[hw] for Max30102
+    // PART_ID, 0x15, and REV_ID.
+    fn device_id(self) -> ?DeviceId [hw]
+        id_read(self)

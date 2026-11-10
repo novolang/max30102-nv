@@ -1,0 +1,1022 @@
+// max30102_tests — the driver over a double of the part: a register file
+// with the part ID, the self-clearing reset and temperature bits, the
+// interrupt flags that a read clears, and a 32-slot FIFO that behaves as
+// the data sheet (19-7740 Rev 1) says: the write and read pointers, the
+// overflow counter that counts samples lost to a full FIFO and clears when
+// a sample is read, and a FIFO_DATA register whose burst read returns the
+// bytes of consecutive samples without moving the register address.  Every
+// transaction advances the clock by 100 us.  The log keeps what the
+// controller sent.
+//
+// Log entries: a write is 1, the register, the bytes, -1; a read is 2, the
+// register, the count, -1.
+//
+// The double's state `st`:
+//   0 the clock in us          1 transactions so far     2 the transaction that fails
+//   3 the first of a run that all fail                   4 1 when a part is there
+//   10 polls the reset takes   11 polls left
+//   12 polls the temperature takes   13 left   14 TINT   15 TFRAC   16 1 while pending
+//   20 write pointer  21 overflow counter  22 read pointer  23 unread samples
+//   24 byte position in the sample being read   26 bytes read from an empty FIFO
+//   30 INT_STATUS_1  31 INT_STATUS_2     99 entries in the log
+
+use std.test
+use embedded_hal.{ BoardI2c, BoardGpio, BoardTimer, I2cBus, GpioOut }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_ppg.{ PpgSample, PpgLed, HeartRate }
+use dev_id.{ DeviceId, Identifiable }
+use max30102
+use max30102.{ Max30102, Max30102Port, Max30102Config, FifoPtrs }
+
+struct Chip
+    regs: HashMap<Int, Int>
+    st: HashMap<Int, Int>
+    log: HashMap<Int, Int>
+    fifo: HashMap<Int, Int>
+
+fn at(m: HashMap<Int, Int>, k: Int) -> Int
+    m.get(k) ?? 0
+
+@tier(app)
+fn chip() -> Chip
+    let c = Chip { regs: HashMap.new(), st: HashMap.new(), log: HashMap.new(), fifo: HashMap.new() }
+    c.regs.insert(0xFF, 0x15)
+    c.regs.insert(0xFE, 0x03)
+    c.st.insert(4, 1)
+    c
+
+fn log_push(c: Chip, v: Int)
+    let n = at(c.st, 99)
+    c.log.insert(n, v)
+    c.st.insert(99, n + 1)
+
+fn log_clear(c: Chip)
+    c.st.insert(99, 0)
+
+// The channels a sample has: two in SpO2 mode, one otherwise.
+fn channels(c: Chip) -> Int
+    if (at(c.regs, 0x09) & 7) == 3
+        return 2
+    1
+
+// Recomputes the samples waiting after a write to a pointer.
+fn recount(c: Chip)
+    var n = (at(c.st, 20) - at(c.st, 22)) & 0x1F
+    if n == 0 and at(c.st, 21) > 0
+        n = 32
+    c.st.insert(23, n)
+    c.st.insert(24, 0)
+
+// The power-on state of the registers, with the part ID kept.
+fn por(c: Chip)
+    for r in 0..0x30
+        c.regs.insert(r, 0)
+
+// Pops one byte of the FIFO for a read of FIFO_DATA.
+fn fifo_pop(c: Chip) -> Int
+    if at(c.st, 23) == 0
+        c.st.insert(26, at(c.st, 26) + 1)
+        return 0
+    let rd = at(c.st, 22)
+    let pos = at(c.st, 24)
+    let b = at(c.fifo, rd * 6 + pos)
+    let bps = channels(c) * 3
+    if pos + 1 == bps
+        c.st.insert(24, 0)
+        c.st.insert(22, (rd + 1) & 0x1F)
+        c.st.insert(23, at(c.st, 23) - 1)
+        c.st.insert(21, 0)
+    else
+        c.st.insert(24, pos + 1)
+    b
+
+fn chip_read(c: Chip, reg: Int) -> Int
+    if reg == 0x00
+        let v = at(c.st, 30)
+        c.st.insert(30, 0)
+        return v
+    if reg == 0x01
+        let v = at(c.st, 31)
+        c.st.insert(31, 0)
+        return v
+    if reg == 0x04
+        return at(c.st, 20)
+    if reg == 0x05
+        return at(c.st, 21)
+    if reg == 0x06
+        return at(c.st, 22)
+    if reg == 0x07
+        return fifo_pop(c)
+    if reg == 0x09 and at(c.st, 11) > 0
+        c.st.insert(11, at(c.st, 11) - 1)
+        if at(c.st, 11) == 0
+            c.regs.insert(0x09, 0)
+        return at(c.regs, 0x09)
+    if reg == 0x21 and at(c.st, 16) == 1
+        if at(c.st, 13) > 0
+            c.st.insert(13, at(c.st, 13) - 1)
+            return 1
+        c.st.insert(16, 0)
+        c.regs.insert(0x1F, at(c.st, 14))
+        c.regs.insert(0x20, at(c.st, 15))
+        c.regs.insert(0x21, 0)
+        return 0
+    at(c.regs, reg)
+
+fn chip_write(c: Chip, reg: Int, v: Int)
+    if reg == 0x04
+        c.st.insert(20, v & 0x1F)
+        recount(c)
+        return
+    if reg == 0x05
+        c.st.insert(21, v & 0x1F)
+        recount(c)
+        return
+    if reg == 0x06
+        c.st.insert(22, v & 0x1F)
+        recount(c)
+        return
+    if reg == 0x09 and (v & 0x40) != 0
+        por(c)
+        c.st.insert(20, 0)
+        c.st.insert(21, 0)
+        c.st.insert(22, 0)
+        recount(c)
+        if at(c.st, 10) > 0
+            c.regs.insert(0x09, 0x40)
+            c.st.insert(11, at(c.st, 10))
+        return
+    if reg == 0x21 and (v & 1) == 1
+        c.regs.insert(0x21, 1)
+        c.st.insert(16, 1)
+        c.st.insert(13, at(c.st, 12))
+        return
+    c.regs.insert(reg, v)
+
+fn fails(c: Chip) -> Bool
+    let n = at(c.st, 1) + 1
+    c.st.insert(1, n)
+    c.st.insert(0, at(c.st, 0) + 100)
+    if at(c.st, 2) == n
+        return true
+    at(c.st, 3) > 0 and n >= at(c.st, 3)
+
+struct FakeI2c
+    c: Chip
+
+impl I2cBus for FakeI2c
+    fn init(self, freq: Int) [hw]
+        self.c.st.insert(31 + 100, freq)
+
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        log_push(self.c, 1)
+        log_push(self.c, data[0] as Int)
+        for i in 1..data.len()
+            log_push(self.c, data[i] as Int)
+        log_push(self.c, -1)
+        if fails(self.c) or addr != 0x57 or at(self.c.st, 4) == 0 or data.len() < 2
+            return false
+        let reg = data[0] as Int
+        for i in 1..data.len()
+            chip_write(self.c, reg + i - 1, data[i] as Int)
+        true
+
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        None
+
+    @tier(app)
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        log_push(self.c, 2)
+        log_push(self.c, tx[0] as Int)
+        log_push(self.c, n)
+        log_push(self.c, -1)
+        if fails(self.c) or addr != 0x57 or at(self.c.st, 4) == 0
+            return None
+        let reg = tx[0] as Int
+        var out: [u8] = []
+        for i in 0..n
+            var r = reg + i
+            if reg == 0x07
+                r = 0x07
+            list.push(out, chip_read(self.c, r) as u8)
+        Some(out)
+
+struct FakePins
+    levels: HashMap<Int, Int>
+    modes: HashMap<Int, Int>
+
+impl GpioOut for FakePins
+    fn mode(self, pin: Int, dir: Int) [hw]
+        self.modes.insert(pin, dir)
+
+    fn set(self, pin: Int, val: Int) [hw]
+        self.levels.insert(pin, val)
+
+    fn get(self, pin: Int) -> Int [hw]
+        at(self.levels, pin)
+
+@tier(app)
+fn pins() -> FakePins
+    FakePins { levels: HashMap.new(), modes: HashMap.new() }
+
+fn wiring() -> DeviceWiring
+    dev_bus.wiring_irq(dev_bus.wiring_i2c(0, 0x57), 9)
+
+struct Dut
+    bus: FakeI2c
+    pins: FakePins
+    c: Chip
+    w: DeviceWiring
+
+impl Max30102Port for Dut
+    fn setup(self) -> Bool [hw]
+        max30102.i2c_setup(self.bus, self.pins, self.w)
+
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        max30102.i2c_read_into(self.bus, self.w, reg, n, var dst)
+
+    fn write_regs(self, reg: Int, src: DevBytes) -> Bool [hw]
+        max30102.i2c_write_from(self.bus, self.w, reg, src)
+
+    fn now_us(self) -> Int [hw]
+        at(self.c.st, 0)
+
+    fn irq_level(self) -> Int [hw]
+        max30102.irq_level_of(self.pins, self.w)
+
+@tier(app)
+fn dut(c: Chip) -> Dut
+    Dut { bus: FakeI2c { c: c }, pins: pins(), c: c, w: wiring() }
+
+fn log_is(c: Chip, want: [Int])
+    test.assert_eq(at(c.st, 99), want.len())
+    for i in 0..want.len()
+        test.assert_eq(at(c.log, i), want[i])
+    log_clear(c)
+
+fn reg_of(c: Chip, r: Int) -> Int
+    at(c.regs, r)
+
+// Pushes one sample into the FIFO at the pulse width the registers say:
+// the counts are left-justified in 18 bits, as the part does.  A full FIFO
+// loses the sample and counts it.
+fn fifo_push(c: Chip, red: Int, ir: Int)
+    if at(c.st, 23) == 32
+        c.st.insert(21, min31(at(c.st, 21) + 1))
+        return
+    let pw = at(c.regs, 0x0A) & 3
+    let shift = 3 - pw
+    let wr = at(c.st, 20)
+    let words = [red << shift, ir << shift]
+    for k in 0..2
+        let w = words[k] & 0x3FFFF
+        c.fifo.insert(wr * 6 + k * 3, (w >> 16) & 0xFF)
+        c.fifo.insert(wr * 6 + k * 3 + 1, (w >> 8) & 0xFF)
+        c.fifo.insert(wr * 6 + k * 3 + 2, w & 0xFF)
+    c.st.insert(20, (wr + 1) & 0x1F)
+    c.st.insert(23, at(c.st, 23) + 1)
+
+fn min31(v: Int) -> Int
+    if v > 31
+        return 31
+    v
+
+// A part brought up by `start` with the default configuration: SpO2 mode,
+// 18-bit counts.
+fn running() -> Chip
+    let c = chip()
+    test.assert(max30102.start(dut(c), max30102.config_default()))
+    log_clear(c)
+    c.st.insert(1, 0)
+    c
+
+fn abs(v: Int) -> Int
+    if v < 0
+        return 0 - v
+    v
+
+// ── Conversions ──────────────────────────────────────────────────────
+
+@test
+fn test_the_averaging_codes() [io, hw]
+    test.assert_eq(max30102.avg_code(1), 0)
+    test.assert_eq(max30102.avg_code(0), 0)
+    test.assert_eq(max30102.avg_code(2), 1)
+    test.assert_eq(max30102.avg_code(3), 2)
+    test.assert_eq(max30102.avg_code(4), 2)
+    test.assert_eq(max30102.avg_code(8), 3)
+    test.assert_eq(max30102.avg_code(16), 4)
+    test.assert_eq(max30102.avg_code(32), 5)
+    test.assert_eq(max30102.avg_code(100), 5)
+    test.assert_eq(max30102.avg_of_code(0), 1)
+    test.assert_eq(max30102.avg_of_code(2), 4)
+    test.assert_eq(max30102.avg_of_code(4), 16)
+    test.assert_eq(max30102.avg_of_code(5), 32)
+    test.assert_eq(max30102.avg_of_code(7), 32)
+
+@test
+fn test_the_pulse_widths_and_their_resolutions() [io, hw]
+    test.assert_eq(max30102.pw_code(69), 0)
+    test.assert_eq(max30102.pw_code(100), 1)
+    test.assert_eq(max30102.pw_code(118), 1)
+    test.assert_eq(max30102.pw_code(200), 2)
+    test.assert_eq(max30102.pw_code(411), 3)
+    test.assert_eq(max30102.pw_code(5000), 3)
+    test.assert_eq(max30102.pw_us_of_code(0), 69)
+    test.assert_eq(max30102.pw_us_of_code(1), 118)
+    test.assert_eq(max30102.pw_us_of_code(2), 215)
+    test.assert_eq(max30102.pw_us_of_code(3), 411)
+    test.assert_eq(max30102.bits_of_pw_code(0), 15)
+    test.assert_eq(max30102.bits_of_pw_code(3), 18)
+
+@test
+fn test_the_adc_ranges() [io, hw]
+    test.assert_eq(max30102.adc_code(2048), 0)
+    test.assert_eq(max30102.adc_code(3000), 1)
+    test.assert_eq(max30102.adc_code(8192), 2)
+    test.assert_eq(max30102.adc_code(16384), 3)
+    test.assert_eq(max30102.adc_code(99999), 3)
+    test.assert_eq(max30102.adc_na_of_code(0), 2048)
+    test.assert_eq(max30102.adc_na_of_code(3), 16384)
+
+@test
+fn test_the_sample_rates_and_what_each_pulse_width_allows() [io, hw]
+    let rates = [50, 100, 200, 400, 800, 1000, 1600, 3200]
+    for i in 0..8
+        test.assert_eq(max30102.sr_of_code(i), rates[i])
+        test.assert_eq(max30102.sr_code(rates[i]), i)
+    test.assert_eq(max30102.sr_code(1), 0)
+    test.assert_eq(max30102.sr_code(150), 2)
+    test.assert_eq(max30102.sr_code(5000), 7)
+    // Table 11 (SpO2) and Table 12 (heart rate): the top rate code of each
+    // pulse width.
+    test.assert_eq(max30102.sr_code_max(0, true), 6)
+    test.assert_eq(max30102.sr_code_max(1, true), 5)
+    test.assert_eq(max30102.sr_code_max(2, true), 4)
+    test.assert_eq(max30102.sr_code_max(3, true), 3)
+    test.assert_eq(max30102.sr_code_max(0, false), 7)
+    test.assert_eq(max30102.sr_code_max(1, false), 6)
+    test.assert_eq(max30102.sr_code_max(2, false), 6)
+    test.assert_eq(max30102.sr_code_max(3, false), 5)
+
+@test
+fn test_a_rate_the_pulse_width_does_not_allow_is_clamped() [io, hw]
+    test.assert_eq(max30102.sr_code_for(400, 3, true), 3)
+    test.assert_eq(max30102.sr_code_for(800, 3, true), 3)
+    test.assert_eq(max30102.sr_code_for(3200, 0, true), 6)
+    test.assert_eq(max30102.sr_code_for(3200, 0, false), 7)
+    test.assert_eq(max30102.sr_code_for(50, 3, true), 0)
+    test.assert_eq(max30102.sr_code_for(1000, 3, false), 5)
+
+@test
+fn test_the_led_current_is_0_2_ma_a_step_and_never_above_the_request() [io, hw]
+    test.assert_eq(max30102.led_code_of_ma(0), 0)
+    test.assert_eq(max30102.led_code_of_ma(-3), 0)
+    test.assert_eq(max30102.led_code_of_ma(1), 5)
+    test.assert_eq(max30102.led_code_of_ma(6), 30)
+    test.assert_eq(max30102.led_code_of_ma(25), 125)
+    test.assert_eq(max30102.led_code_of_ma(50), 250)
+    test.assert_eq(max30102.led_code_of_ma(51), 255)
+    test.assert_eq(max30102.led_code_of_ma(200), 255)
+    test.assert_eq(max30102.ma_of_led_code(0), 0)
+    test.assert_eq(max30102.ma_of_led_code(0x0F), 3)
+    test.assert_eq(max30102.ma_of_led_code(0x1F), 6)
+    test.assert_eq(max30102.ma_of_led_code(0x7F), 25)
+    test.assert_eq(max30102.ma_of_led_code(0xFF), 51)
+    for ma in [1, 2, 3, 7, 12, 25, 33, 50]
+        test.assert(max30102.ma_of_led_code(max30102.led_code_of_ma(ma)) <= ma)
+
+@test
+fn test_the_die_temperature_adds_the_fraction_even_below_zero() [io, hw]
+    test.assert_eq(max30102.temp_milli_c_of(0x19, 0x00), 25000)
+    test.assert_eq(max30102.temp_milli_c_of(0x19, 0x08), 25500)
+    test.assert_eq(max30102.temp_milli_c_of(0x19, 0x01), 25062)
+    test.assert_eq(max30102.temp_milli_c_of(0xFF, 0x08), -500)
+    test.assert_eq(max30102.temp_milli_c_of(0x80, 0x08), -127500)
+    test.assert_eq(max30102.temp_milli_c_of(0x7F, 0x0F), 127937)
+    test.assert_eq(max30102.temp_milli_c_of(0x19, 0xF8), 25500)
+
+@test
+fn test_a_count_is_the_18_bit_word_less_the_bits_the_resolution_leaves_zero() [io, hw]
+    // The data sheet's Table 1: the word is left-justified.
+    test.assert_eq(max30102.count_of_bytes(0xFF, 0x12, 0x34, 3), 201268)
+    test.assert_eq(max30102.count_of_bytes(0x03, 0xFF, 0xF8, 0), 0x7FFF)
+    test.assert_eq(max30102.count_of_bytes(0x03, 0xFF, 0xFC, 1), 0xFFFF)
+    test.assert_eq(max30102.count_of_bytes(0x03, 0xFF, 0xFE, 2), 0x1FFFF)
+    test.assert_eq(max30102.count_of_bytes(0x00, 0x00, 0x00, 3), 0)
+
+// ── The configuration ────────────────────────────────────────────────
+
+@test
+fn test_the_default_configuration_bytes() [io, hw]
+    let c = max30102.config_default()
+    test.assert(c.spo2)
+    test.assert(not c.rollover)
+    test.assert_eq(max30102.fifo_config_of(c), 0x4A)
+    test.assert_eq(max30102.spo2_config_of(c), 0x2F)
+    test.assert_eq(max30102.fifo_rate_of(0x4A, 0x2F), 100)
+    test.assert_eq(max30102.period_us_of(0x4A, 0x2F), 10000)
+
+@test
+fn test_rollover_and_a_clamped_rate_reach_the_bytes() [io, hw]
+    let c = Max30102Config { spo2: false, averaging: 1, rollover: true, full_empty: 15, rate_sps: 3200, pulse_us: 69, adc_na: 16384, red_pa: 1, ir_pa: 2 }
+    test.assert_eq(max30102.fifo_config_of(c), 0x1F)
+    // Heart rate mode, 69 us: 3200 sps is allowed, code 7.
+    test.assert_eq(max30102.spo2_config_of(c), 0x60 | 0x1C)
+    let s = Max30102Config { spo2: true, averaging: 32, rollover: false, full_empty: 0, rate_sps: 3200, pulse_us: 411, adc_na: 2048, red_pa: 0, ir_pa: 0 }
+    test.assert_eq(max30102.fifo_config_of(s), 0xA0)
+    // SpO2 mode, 411 us: no more than 400 sps, code 3.
+    test.assert_eq(max30102.spo2_config_of(s), 0x00 | 0x0C | 3)
+
+// ── The bus ──────────────────────────────────────────────────────────
+
+@test
+fn test_a_read_is_the_register_then_a_repeated_start() [io, hw]
+    let c = chip()
+    var b: DevBytes = Vec.new()
+    test.assert(max30102.i2c_read_into(FakeI2c { c: c }, wiring(), 0xFE, 1, var b))
+    test.assert_eq(b[0] as Int, 0x03)
+    log_is(c, [2, 0xFE, 1, -1])
+
+@test
+fn test_a_write_is_the_register_then_the_bytes() [io, hw]
+    let c = chip()
+    var s: DevBytes = Vec.new()
+    let _ = s.push(0x12 as u8)
+    let _ = s.push(0x34 as u8)
+    test.assert(max30102.i2c_write_from(FakeI2c { c: c }, wiring(), 0x30, s))
+    log_is(c, [1, 0x30, 0x12, 0x34, -1])
+    test.assert_eq(reg_of(c, 0x31), 0x34)
+
+@test
+fn test_setup_makes_the_interrupt_pin_an_input_and_the_bus_fast() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(d.setup())
+    test.assert_eq(at(c.st, 131), 400000)
+    test.assert_eq(at(d.pins.modes, 9), 0)
+    let noirq = Dut { bus: FakeI2c { c: c }, pins: pins(), c: c, w: dev_bus.wiring_i2c(0, 0x57) }
+    test.assert(noirq.setup())
+    let spi = Dut { bus: FakeI2c { c: c }, pins: pins(), c: c, w: DeviceWiring { bus: 0, addr: None, cs: Some(3), irq: None, en: None } }
+    test.assert(not spi.setup())
+
+@test
+fn test_the_interrupt_level_follows_the_wiring() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert_eq(d.irq_level(), 0)
+    d.pins.levels.insert(9, 1)
+    test.assert_eq(d.irq_level(), 1)
+    let noirq = Dut { bus: FakeI2c { c: c }, pins: pins(), c: c, w: dev_bus.wiring_i2c(0, 0x57) }
+    test.assert_eq(noirq.irq_level(), -1)
+
+@test
+fn test_register_access() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(max30102.wr(d, 0x30, 0x1AB))
+    test.assert(max30102.rd(d, 0x30) == Some(0xAB))
+    test.assert(max30102.upd(d, 0x30, 0x0F, 0x03))
+    test.assert_eq(reg_of(c, 0x30), 0xA3)
+    c.st.insert(4, 0)
+    test.assert(max30102.rd(d, 0x30) == None)
+    test.assert(not max30102.wr(d, 0x30, 1))
+    test.assert(not max30102.upd(d, 0x30, 1, 1))
+
+// ── Identity, reset and shutdown ─────────────────────────────────────
+
+@test
+fn test_the_part_id_is_0x15_and_the_revision_comes_with_it() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(max30102.part_ok(d))
+    match max30102.id_read(d)
+        Some(id) =>
+            test.assert_eq(id.who, 0x15)
+            test.assert(id.rev == Some(0x03))
+        None => test.assert(false)
+    c.regs.insert(0xFF, 0x11)
+    test.assert(not max30102.part_ok(d))
+    test.assert(max30102.id_read(d) == None)
+    c.st.insert(4, 0)
+    test.assert(max30102.id_read(d) == None)
+
+@test
+fn test_a_reset_that_takes_a_few_polls_is_waited_for() [io, hw]
+    let c = chip()
+    c.regs.insert(0x20, 0x55)
+    c.st.insert(10, 3)
+    let d = dut(c)
+    test.assert(max30102.reset(d))
+    test.assert_eq(reg_of(c, 0x09), 0)
+    test.assert_eq(reg_of(c, 0x20), 0)
+    test.assert_eq(reg_of(c, 0xFF), 0x15)
+
+@test
+fn test_a_reset_that_is_done_at_once_needs_one_read() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(max30102.reset(d))
+    log_is(c, [1, 0x09, 0x40, -1, 2, 0x09, 1, -1])
+
+@test
+fn test_a_reset_that_never_ends_times_out_after_100_ms() [io, hw]
+    let c = chip()
+    c.st.insert(10, 100000)
+    let d = dut(c)
+    test.assert(not max30102.reset(d))
+    test.assert(at(c.st, 0) >= 100000)
+
+@test
+fn test_a_reset_fails_when_the_part_does_not_answer() [io, hw]
+    let c = chip()
+    c.st.insert(2, 1)
+    test.assert(not max30102.reset(dut(c)))
+    let c2 = chip()
+    c2.st.insert(2, 2)
+    test.assert(not max30102.reset(dut(c2)))
+
+@test
+fn test_shutdown_sets_bit_7_and_leaves_the_mode() [io, hw]
+    let c = running()
+    let d = dut(c)
+    test.assert(max30102.shutdown(d, true))
+    test.assert_eq(reg_of(c, 0x09), 0x83)
+    test.assert(max30102.shutdown(d, false))
+    test.assert_eq(reg_of(c, 0x09), 0x03)
+
+// ── The FIFO pointers ────────────────────────────────────────────────
+
+@test
+fn test_the_pointers_are_read_in_one_read_that_stops_before_fifo_data() [io, hw]
+    let c = chip()
+    c.st.insert(20, 7)
+    c.st.insert(21, 2)
+    c.st.insert(22, 3)
+    let d = dut(c)
+    match max30102.ptrs_read(d)
+        Some(f) =>
+            test.assert_eq(f.wr, 7)
+            test.assert_eq(f.ovf, 2)
+            test.assert_eq(f.rd, 3)
+        None => test.assert(false)
+    log_is(c, [2, 0x04, 3, -1])
+    c.st.insert(4, 0)
+    test.assert(max30102.ptrs_read(d) == None)
+
+@test
+fn test_samples_waiting_follow_the_pointers_around_the_wrap() [io, hw]
+    test.assert_eq(max30102.available_of(FifoPtrs { wr: 5, ovf: 0, rd: 2 }), 3)
+    test.assert_eq(max30102.available_of(FifoPtrs { wr: 2, ovf: 0, rd: 30 }), 4)
+    test.assert_eq(max30102.available_of(FifoPtrs { wr: 9, ovf: 0, rd: 9 }), 0)
+
+@test
+fn test_pointers_that_meet_with_samples_lost_mean_a_full_fifo() [io, hw]
+    // The max3010x crate counts this as empty and never drains the FIFO.
+    test.assert_eq(max30102.available_of(FifoPtrs { wr: 9, ovf: 3, rd: 9 }), 32)
+    test.assert_eq(max30102.available_of(FifoPtrs { wr: 10, ovf: 3, rd: 9 }), 1)
+
+@test
+fn test_fifo_available_reads_the_pointers() [io, hw]
+    let c = running()
+    let d = dut(c)
+    test.assert_eq(max30102.fifo_available(d), 0)
+    fifo_push(c, 100, 200)
+    fifo_push(c, 101, 201)
+    test.assert_eq(max30102.fifo_available(d), 2)
+    c.st.insert(4, 0)
+    test.assert_eq(max30102.fifo_available(d), -1)
+
+@test
+fn test_clearing_the_fifo_writes_the_three_pointers_in_one_write() [io, hw]
+    let c = running()
+    let d = dut(c)
+    fifo_push(c, 1, 2)
+    c.st.insert(21, 4)
+    log_clear(c)
+    test.assert(max30102.fifo_clear(d))
+    log_is(c, [1, 0x04, 0, 0, 0, -1])
+    test.assert_eq(at(c.st, 20), 0)
+    test.assert_eq(at(c.st, 21), 0)
+    test.assert_eq(at(c.st, 22), 0)
+
+@test
+fn test_the_read_pointer_is_written_back_alone() [io, hw]
+    let c = running()
+    let d = dut(c)
+    test.assert(max30102.rd_ptr_set(d, 0x25))
+    log_is(c, [1, 0x06, 0x05, -1])
+
+@test
+fn test_the_configuration_bytes_are_read_together() [io, hw]
+    let c = running()
+    let d = dut(c)
+    match max30102.cfg_read(d)
+        Some(b) =>
+            test.assert_eq(b.fifo, 0x4A)
+            test.assert_eq(b.mode, 0x03)
+            test.assert_eq(b.spo2, 0x2F)
+        None => test.assert(false)
+    log_is(c, [2, 0x08, 3, -1])
+    c.st.insert(4, 0)
+    test.assert(max30102.cfg_read(d) == None)
+
+@test
+fn test_the_channels_of_a_mode() [io, hw]
+    test.assert_eq(max30102.channels_of(0x03), 2)
+    test.assert_eq(max30102.channels_of(0x02), 1)
+    test.assert_eq(max30102.channels_of(0x07), 2)
+    test.assert_eq(max30102.channels_of(0x83), 2)
+
+// ── Draining the FIFO ────────────────────────────────────────────────
+
+@test
+fn test_an_empty_fifo_drains_nothing_and_reads_only_the_pointers() [io, hw]
+    let c = running()
+    let d = dut(c)
+    var out: Vec[PpgSample; 32] = Vec.new()
+    test.assert_eq(max30102.drain(d, var out), 0)
+    test.assert_eq(out.len(), 0)
+    log_is(c, [2, 0x04, 3, -1])
+
+@test
+fn test_three_samples_come_out_oldest_first_with_red_and_infrared() [io, hw]
+    let c = running()
+    let d = dut(c)
+    fifo_push(c, 1000, 2000)
+    fifo_push(c, 1001, 2002)
+    fifo_push(c, 131071, 262143)
+    var out: Vec[PpgSample; 32] = Vec.new()
+    test.assert_eq(max30102.drain(d, var out), 3)
+    test.assert_eq(out.len(), 3)
+    test.assert_eq(out[0].red, 1000)
+    test.assert_eq(out[0].ir, 2000)
+    test.assert_eq(out[1].red, 1001)
+    test.assert_eq(out[1].ir, 2002)
+    test.assert_eq(out[2].red, 131071)
+    test.assert_eq(out[2].ir, 262143)
+    test.assert(out[0].green == None)
+    // The pointers, the configuration, then one burst of 3 x 6 bytes.
+    log_is(c, [2, 0x04, 3, -1, 2, 0x08, 3, -1, 2, 0x07, 18, -1])
+    test.assert_eq(at(c.st, 26), 0)
+    test.assert_eq(at(c.st, 22), at(c.st, 20))
+    test.assert_eq(at(c.st, 23), 0)
+
+@test
+fn test_the_samples_are_stamped_one_fifo_period_apart_ending_at_the_drain() [io, hw]
+    let c = running()
+    let d = dut(c)
+    fifo_push(c, 1, 2)
+    fifo_push(c, 3, 4)
+    fifo_push(c, 5, 6)
+    var out: Vec[PpgSample; 32] = Vec.new()
+    let _ = max30102.drain(d, var out)
+    test.assert_eq(out[2].at_us - out[1].at_us, 10000)
+    test.assert_eq(out[1].at_us - out[0].at_us, 10000)
+    test.assert(out[2].at_us > 0 and out[2].at_us <= at(c.st, 0))
+
+@test
+fn test_nine_samples_are_read_in_two_bursts_of_at_most_30_bytes() [io, hw]
+    let c = running()
+    let d = dut(c)
+    for i in 0..9
+        fifo_push(c, 100 + i, 500 + i)
+    var out: Vec[PpgSample; 32] = Vec.new()
+    test.assert_eq(max30102.drain(d, var out), 9)
+    for i in 0..9
+        test.assert_eq(out[i].red, 100 + i)
+        test.assert_eq(out[i].ir, 500 + i)
+    log_is(c, [2, 0x04, 3, -1, 2, 0x08, 3, -1, 2, 0x07, 30, -1, 2, 0x07, 24, -1])
+
+@test
+fn test_a_full_fifo_that_lost_samples_drains_all_32_in_seven_bursts() [io, hw]
+    let c = running()
+    let d = dut(c)
+    for i in 0..35
+        fifo_push(c, 10 + i, 900 + i)
+    test.assert_eq(at(c.st, 21), 3)
+    // The pointers have met: the crate's rule reads 0.
+    var out: Vec[PpgSample; 32] = Vec.new()
+    test.assert_eq(max30102.drain(d, var out), 32)
+    test.assert_eq(out[0].red, 10)
+    test.assert_eq(out[31].red, 41)
+    test.assert_eq(out[31].ir, 931)
+    // Reading a sample clears the overflow counter.
+    test.assert_eq(at(c.st, 21), 0)
+    test.assert_eq(at(c.st, 26), 0)
+    test.assert_eq(max30102.lost(d), 0)
+
+@test
+fn test_the_samples_lost_are_the_overflow_counter() [io, hw]
+    let c = running()
+    let d = dut(c)
+    for i in 0..34
+        fifo_push(c, i, i)
+    test.assert_eq(max30102.lost(d), 2)
+    c.st.insert(4, 0)
+    test.assert_eq(max30102.lost(d), 0)
+
+@test
+fn test_heart_rate_mode_reads_one_channel_and_ten_samples_a_burst() [io, hw]
+    let c = chip()
+    let hr = Max30102Config { spo2: false, averaging: 1, rollover: false, full_empty: 8, rate_sps: 100, pulse_us: 411, adc_na: 4096, red_pa: 0x20, ir_pa: 0 }
+    test.assert(max30102.start(dut(c), hr))
+    log_clear(c)
+    for i in 0..12
+        fifo_push_red(c, 300 + i)
+    let d = dut(c)
+    var out: Vec[PpgSample; 32] = Vec.new()
+    test.assert_eq(max30102.drain(d, var out), 12)
+    test.assert_eq(out[0].red, 300)
+    test.assert_eq(out[11].red, 311)
+    test.assert_eq(out[0].ir, 0)
+    log_is(c, [2, 0x04, 3, -1, 2, 0x08, 3, -1, 2, 0x07, 30, -1, 2, 0x07, 6, -1])
+    test.assert_eq(out[1].at_us - out[0].at_us, 10000)
+
+// Pushes a one-channel sample (heart rate mode).
+fn fifo_push_red(c: Chip, red: Int)
+    let pw = at(c.regs, 0x0A) & 3
+    let wr = at(c.st, 20)
+    let w = (red << (3 - pw)) & 0x3FFFF
+    c.fifo.insert(wr * 6, (w >> 16) & 0xFF)
+    c.fifo.insert(wr * 6 + 1, (w >> 8) & 0xFF)
+    c.fifo.insert(wr * 6 + 2, w & 0xFF)
+    c.st.insert(20, (wr + 1) & 0x1F)
+    c.st.insert(23, at(c.st, 23) + 1)
+
+@test
+fn test_a_count_is_shifted_by_the_pulse_width_the_registers_hold() [io, hw]
+    let c = running()
+    let d = dut(c)
+    // 15-bit conversions: the part left-justifies, the driver shifts back.
+    c.regs.insert(0x0A, (c.regs.get(0x0A) ?? 0) & 0x7C)
+    fifo_push(c, 32767, 12345)
+    var out: Vec[PpgSample; 32] = Vec.new()
+    test.assert_eq(max30102.drain(d, var out), 1)
+    test.assert_eq(out[0].red, 32767)
+    test.assert_eq(out[0].ir, 12345)
+
+@test
+fn test_a_failed_burst_puts_the_read_pointer_back() [io, hw]
+    let c = running()
+    let d = dut(c)
+    for i in 0..9
+        fifo_push(c, i, i)
+    // The pointers, the configuration, the first burst, then the second fails.
+    c.st.insert(2, 4)
+    var out: Vec[PpgSample; 32] = Vec.new()
+    test.assert_eq(max30102.drain(d, var out), -1)
+    test.assert_eq(out.len(), 0)
+    test.assert_eq(at(c.st, 22), 0)
+    test.assert_eq(at(c.st, 23), 9)
+    // A later drain reads all nine again.
+    c.st.insert(2, 0)
+    test.assert_eq(max30102.drain(d, var out), 9)
+    test.assert_eq(out[8].red, 8)
+
+@test
+fn test_a_drain_fails_cleanly_on_any_one_failed_transaction() [io, hw]
+    let good = running()
+    for i in 0..9
+        fifo_push(good, i, i)
+    var out0: Vec[PpgSample; 32] = Vec.new()
+    test.assert_eq(max30102.drain(dut(good), var out0), 9)
+    let n = at(good.st, 1)
+    for k in 1..(n + 1)
+        let c = running()
+        for i in 0..9
+            fifo_push(c, i, i)
+        c.st.insert(2, k)
+        var out: Vec[PpgSample; 32] = Vec.new()
+        test.assert_eq(max30102.drain(dut(c), var out), -1)
+        test.assert_eq(out.len(), 0)
+
+// ── The settings ─────────────────────────────────────────────────────
+
+@test
+fn test_the_leds_are_set_in_0_2_ma_steps_and_green_is_refused() [io, hw]
+    let c = running()
+    let d = dut(c)
+    test.assert_eq(max30102.led_set(d, PpgLed.PpgRed, 6), 6)
+    test.assert_eq(reg_of(c, 0x0C), 30)
+    test.assert_eq(max30102.led_set(d, PpgLed.PpgIr, 50), 50)
+    test.assert_eq(reg_of(c, 0x0D), 250)
+    test.assert_eq(max30102.led_set(d, PpgLed.PpgIr, 400), 51)
+    test.assert_eq(reg_of(c, 0x0D), 255)
+    test.assert_eq(max30102.led_set(d, PpgLed.PpgRed, -1), 0)
+    test.assert_eq(reg_of(c, 0x0C), 0)
+    log_clear(c)
+    test.assert_eq(max30102.led_set(d, PpgLed.PpgGreen, 10), 0)
+    test.assert_eq(at(c.st, 99), 0)
+    c.st.insert(4, 0)
+    test.assert_eq(max30102.led_set(d, PpgLed.PpgRed, 6), 0)
+
+@test
+fn test_the_rate_is_the_least_at_or_above_with_the_averaging_kept() [io, hw]
+    let c = running()
+    let d = dut(c)
+    // Averaging 4, 411 us in SpO2 mode: the ADC may run at 400 sps at most,
+    // which fills the FIFO at 100.
+    test.assert_eq(max30102.rate_set(d, 100), 100)
+    test.assert_eq(reg_of(c, 0x0A), 0x2F)
+    test.assert_eq(max30102.rate_set(d, 50), 50)
+    test.assert_eq(reg_of(c, 0x0A), 0x2B)
+    test.assert_eq(max30102.rate_set(d, 60), 100)
+    test.assert_eq(max30102.rate_set(d, 1000), 100)
+    test.assert_eq(reg_of(c, 0x0A), 0x2F)
+
+@test
+fn test_a_shorter_pulse_allows_a_faster_rate() [io, hw]
+    let c = running()
+    let d = dut(c)
+    c.regs.insert(0x0A, 0x20)
+    test.assert_eq(max30102.rate_set(d, 400), 400)
+    test.assert_eq(reg_of(c, 0x0A), 0x20 | (6 << 2))
+    test.assert_eq(max30102.rate_set(d, 1000), 400)
+
+@test
+fn test_heart_rate_mode_allows_3200_sps_at_69_us() [io, hw]
+    let c = chip()
+    let hr = Max30102Config { spo2: false, averaging: 1, rollover: false, full_empty: 8, rate_sps: 100, pulse_us: 69, adc_na: 4096, red_pa: 0x20, ir_pa: 0 }
+    test.assert(max30102.start(dut(c), hr))
+    test.assert_eq(max30102.rate_set(dut(c), 3200), 3200)
+    test.assert_eq(max30102.rate_set(dut(c), 9000), 3200)
+
+@test
+fn test_the_rate_fails_when_the_part_does_not_answer() [io, hw]
+    let c = running()
+    c.st.insert(2, 1)
+    test.assert_eq(max30102.rate_set(dut(c), 100), 0)
+    let c2 = running()
+    c2.st.insert(2, 2)
+    test.assert_eq(max30102.rate_set(dut(c2), 100), 0)
+    let c3 = running()
+    c3.st.insert(2, 3)
+    test.assert_eq(max30102.rate_set(dut(c3), 100), 0)
+
+// ── Interrupts ───────────────────────────────────────────────────────
+
+@test
+fn test_the_interrupt_enable_masks_go_to_the_two_registers() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(max30102.int_enable(d, 0x8000 | 0x2000 | 0x0002))
+    log_is(c, [1, 0x02, 0xA0, 0x02, -1])
+    test.assert(max30102.int_enable(d, 0xFFFF))
+    test.assert_eq(reg_of(c, 0x02), 0xE0)
+    test.assert_eq(reg_of(c, 0x03), 0x02)
+    test.assert(max30102.int_enable(d, 0))
+    test.assert_eq(reg_of(c, 0x02), 0)
+
+@test
+fn test_reading_the_status_clears_it_and_returns_both_registers() [io, hw]
+    let c = chip()
+    c.st.insert(30, 0xC1)
+    c.st.insert(31, 0x02)
+    let d = dut(c)
+    test.assert_eq(max30102.int_status(d), 0xC102)
+    test.assert_eq(max30102.int_status(d), 0)
+    c.st.insert(4, 0)
+    test.assert_eq(max30102.int_status(d), -1)
+
+// ── The temperature ──────────────────────────────────────────────────
+
+@test
+fn test_one_temperature_reading_waits_for_the_enable_bit_to_clear() [io, hw]
+    let c = chip()
+    c.st.insert(12, 3)
+    c.st.insert(14, 0x19)
+    c.st.insert(15, 0x08)
+    let d = dut(c)
+    test.assert(max30102.temperature(d) == Some(25500))
+    test.assert_eq(reg_of(c, 0x21), 0)
+
+@test
+fn test_a_negative_temperature() [io, hw]
+    let c = chip()
+    c.st.insert(14, 0xFE)
+    c.st.insert(15, 0x04)
+    test.assert(max30102.temperature(dut(c)) == Some(-1750))
+
+@test
+fn test_a_temperature_that_never_finishes_times_out() [io, hw]
+    let c = chip()
+    c.st.insert(12, 100000)
+    test.assert(max30102.temperature(dut(c)) == None)
+    test.assert(at(c.st, 0) >= 100000)
+
+@test
+fn test_the_temperature_fails_on_any_one_failed_transaction() [io, hw]
+    let c = chip()
+    c.st.insert(12, 1)
+    test.assert(max30102.temperature(dut(c)) != None)
+    let n = at(c.st, 1)
+    for k in 1..(n + 1)
+        let c2 = chip()
+        c2.st.insert(12, 1)
+        c2.st.insert(2, k)
+        test.assert(max30102.temperature(dut(c2)) == None)
+
+// ── The bring-up ─────────────────────────────────────────────────────
+
+@test
+fn test_start_writes_the_default_configuration_and_releases_the_interrupt() [io, hw]
+    let c = chip()
+    // After power-up PWR_RDY holds INT low until the status is read.
+    c.st.insert(30, 0x01)
+    c.regs.insert(0x02, 0xFF)
+    let d = dut(c)
+    test.assert(max30102.start(d, max30102.config_default()))
+    test.assert_eq(reg_of(c, 0x08), 0x4A)
+    test.assert_eq(reg_of(c, 0x0A), 0x2F)
+    test.assert_eq(reg_of(c, 0x0C), 0x1F)
+    test.assert_eq(reg_of(c, 0x0D), 0x1F)
+    test.assert_eq(reg_of(c, 0x09), 0x03)
+    test.assert_eq(reg_of(c, 0x02), 0)
+    test.assert_eq(at(c.st, 30), 0)
+    test.assert_eq(at(c.st, 20) + at(c.st, 21) + at(c.st, 22), 0)
+
+@test
+fn test_the_mode_is_written_last_so_sampling_starts_on_a_clean_fifo() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(max30102.configure(d, max30102.config_default()))
+    let n = at(c.st, 99)
+    // The last entry before the end is the MODE_CONFIG write.
+    test.assert_eq(at(c.log, n - 4), 1)
+    test.assert_eq(at(c.log, n - 3), 0x09)
+    test.assert_eq(at(c.log, n - 2), 0x03)
+    // The FIFO was cleared before it.
+    test.assert_eq(at(c.log, n - 9), 0x04)
+
+@test
+fn test_heart_rate_mode_starts_in_mode_2() [io, hw]
+    let c = chip()
+    let hr = Max30102Config { spo2: false, averaging: 2, rollover: true, full_empty: 4, rate_sps: 200, pulse_us: 215, adc_na: 8192, red_pa: 0x30, ir_pa: 0 }
+    test.assert(max30102.start(dut(c), hr))
+    test.assert_eq(reg_of(c, 0x09), 0x02)
+    test.assert_eq(reg_of(c, 0x08), 0x20 | 0x10 | 0x04)
+
+@test
+fn test_start_refuses_a_part_that_is_not_a_max30102() [io, hw]
+    let c = chip()
+    c.regs.insert(0xFF, 0x00)
+    test.assert(not max30102.start(dut(c), max30102.config_default()))
+    let c2 = chip()
+    c2.st.insert(4, 0)
+    test.assert(not max30102.start(dut(c2), max30102.config_default()))
+    let spi = Dut { bus: FakeI2c { c: chip() }, pins: pins(), c: chip(), w: DeviceWiring { bus: 0, addr: None, cs: Some(3), irq: None, en: None } }
+    test.assert(not max30102.start(spi, max30102.config_default()))
+
+@test
+fn test_start_fails_on_any_one_failed_transaction() [io, hw]
+    let c = chip()
+    c.st.insert(10, 2)
+    test.assert(max30102.start(dut(c), max30102.config_default()))
+    let n = at(c.st, 1)
+    for k in 1..(n + 1)
+        let c2 = chip()
+        c2.st.insert(10, 2)
+        c2.st.insert(2, k)
+        test.assert(not max30102.start(dut(c2), max30102.config_default()))
+
+@test
+fn test_start_fails_when_the_reset_never_ends() [io, hw]
+    let c = chip()
+    c.st.insert(10, 1000000)
+    test.assert(not max30102.start(dut(c), max30102.config_default()))
+
+// ── The type over the host's board handles ───────────────────────────
+//
+// The host's I2C bus is absent hardware: every transfer is refused, so
+// each method answers its "no part" value.
+
+@test
+fn test_the_type_over_absent_hardware() [io, hw]
+    let p = Max30102.attach(BoardI2c { id: 0 }, BoardTimer { id: 0 }, BoardGpio { id: 0 }, wiring())
+    test.assert(p.now_us() >= 0)
+    test.assert(not p.begin())
+    test.assert(not p.begin_with(max30102.config_default()))
+    test.assert(p.reg(0xFF) == None)
+    test.assert(not p.set_reg(0x30, 1))
+    test.assert(not p.shutdown(true))
+    test.assert(not p.clear_fifo())
+    test.assert_eq(p.fifo_count(), -1)
+    test.assert(not p.set_almost_full(5))
+    test.assert(not p.interrupts_enable(0x8000))
+    test.assert_eq(p.interrupts_read(), -1)
+    test.assert(p.temperature_milli_c() == None)
+    test.assert_eq(p.int_level(), 0)
+    test.assert_eq(p.ppg_set_rate_hz(100), 0)
+    test.assert_eq(p.ppg_set_led_ma(PpgLed.PpgRed, 6), 0)
+    test.assert_eq(p.ppg_lost(), 0)
+    var out: Vec[PpgSample; 32] = Vec.new()
+    test.assert_eq(p.ppg_drain(var out), -1)
+    test.assert(p.device_id() == None)
+
+@test
+fn test_the_almost_full_level_changes_only_its_own_bits() [io, hw]
+    let c = running()
+    let d = dut(c)
+    test.assert(max30102.upd(d, 0x08, 0x0F, 3))
+    test.assert_eq(reg_of(c, 0x08), 0x43)
