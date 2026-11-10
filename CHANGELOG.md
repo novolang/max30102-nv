@@ -47,9 +47,7 @@ sensor on an I2C bus, with a beat detector over its infrared counts.
 - Not implemented: the SpO2 calculation, the multi-LED mode, the MAX30101's
   green LED, `HeartRateAsync` and an interrupt-driven wake, a total of
   samples lost.
-- `devices-nv` is a path dependency (`../devices-nv`, 0.3.3), which has the
-  `HeartRate` trait and is not on the registry yet. `embedded-hal-nv` is the
-  registry's 0.3.2, because a path copy of it conflicts with the registry
-  requirement of devices-nv.
+- `devices-nv` is the registry range `^0.3.3`, the first release with the
+  `HeartRate` trait. `embedded-hal-nv` is the registry range `^0.3.2`.
 - The `[tier]` of the manifest is `embedded`, the strictest, so the module
   also checks at `rt` and `system`.
