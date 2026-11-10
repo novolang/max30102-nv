@@ -11,6 +11,8 @@
 use std.test
 use dev_ppg.{ PpgSample, PpgLed, HeartRate }
 use ppg_beat
+use embedded_hal.{ BoardI2c, BoardGpio, BoardTimer }
+use max30102.{ Max30102 }
 use ppg_beat.{ Beat, BeatConfig }
 
 // The next pseudo-random value, 31 bits.
@@ -250,3 +252,8 @@ fn test_the_detector_reads_red_when_there_is_no_infrared() [io, hw]
     let b = PpgSample { red: 500, ir: 0, green: None, at_us: 0 }
     test.assert_eq(ppg_beat.signal_of(a), 900)
     test.assert_eq(ppg_beat.signal_of(b), 500)
+
+@test
+fn test_beat_run_takes_the_driver_on_a_plain_parameter() [io, hw]
+    let p = Max30102.attach(BoardI2c { id: 0 }, BoardTimer { id: 0 }, BoardGpio { id: 0 }, dev_bus.wiring_i2c(0, 0x57))
+    test.assert(ppg_beat.beat_run(p, ppg_beat.beat_new(), ppg_beat.beat_config_default()) == None)
