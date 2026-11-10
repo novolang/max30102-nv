@@ -18,6 +18,20 @@ the host suite, and the beat detector only over synthesised waveforms. The
 device program below builds for the nRF52840 DK and the nRF54LM20 DK and
 has not been flashed.
 
+## Install
+
+```sh
+novo pkg add max30102-nv
+```
+
+The device program is `examples/pulse_reader.nv`.  Make it the `main` of a package that
+depends on this one and build it for a board:
+
+```sh
+novo build --target=nrf52840-dk src/main.nv
+novo build --target=nrf54lm20-dk src/main.nv
+```
+
 ## The device program
 
 `examples/pulse_reader.nv` brings the sensor up, drains its FIFO ten times
@@ -46,7 +60,7 @@ fn digits(n: Int) [hw]
             div = div * 10
     for _k in 0..19
         if div > 0
-            hal.uart.write_byte(48 + (n / div) % 10)
+            hal.uart.write_byte(48 + n / div % 10)
             div = div / 10
 
 // Writes the line for the newest sample and the detector.

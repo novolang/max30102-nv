@@ -50,7 +50,7 @@ fn digits(n: Int) [hw]
             div = div * 10
     for _k in 0..19
         if div > 0
-            hal.uart.write_byte(48 + (n / div) % 10)
+            hal.uart.write_byte(48 + n / div % 10)
             div = div / 10
 
 // Writes the line for the newest sample and the detector.

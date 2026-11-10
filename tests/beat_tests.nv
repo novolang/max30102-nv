@@ -35,7 +35,7 @@ fn sample(i: Int, bpm: Int, amp: Int, base: Int, noise: Int, seed: Int) -> Int
 fn run(bpm: Int, secs: Int, amp: Int, noise: Int, invert: Bool) -> Beat
     let c = BeatConfig { fs_hz: 100, invert: invert, min_signal: 20000, min_amp: 20 }
     var d = ppg_beat.beat_new()
-    for i in 0..(secs * 100)
+    for i in 0..secs * 100
         var x = sample(i, bpm, amp, 100000, noise, 17)
         if invert
             x = 200000 - x
@@ -231,8 +231,9 @@ fn test_beat_run_drains_and_feeds_every_sample() [io, hw]
     var d = ppg_beat.beat_new()
     for _call in 0..80
         match ppg_beat.beat_run(p, d, c)
-            Some(next) => d = next
-            None => test.assert(false)
+            Some(next) =>
+                d = next
+            None       => test.assert(false)
     test.assert_eq(p.st.get(0) ?? 0, 2000)
     test.assert(abs(d.bpm - 78) <= 2)
     test.assert(abs(d.beats - 26) <= 2)

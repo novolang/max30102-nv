@@ -419,11 +419,27 @@ fn test_the_default_configuration_bytes() [io, hw]
 
 @test
 fn test_rollover_and_a_clamped_rate_reach_the_bytes() [io, hw]
-    let c = Max30102Config { spo2: false, averaging: 1, rollover: true, full_empty: 15, rate_sps: 3200, pulse_us: 69, adc_na: 16384, red_pa: 1, ir_pa: 2 }
+    let c = Max30102Config { spo2: false,
+        averaging: 1,
+        rollover: true,
+        full_empty: 15,
+        rate_sps: 3200,
+        pulse_us: 69,
+        adc_na: 16384,
+        red_pa: 1,
+        ir_pa: 2 }
     test.assert_eq(max30102.fifo_config_of(c), 0x1F)
     // Heart rate mode, 69 us: 3200 sps is allowed, code 7.
     test.assert_eq(max30102.spo2_config_of(c), 0x60 | 0x1C)
-    let s = Max30102Config { spo2: true, averaging: 32, rollover: false, full_empty: 0, rate_sps: 3200, pulse_us: 411, adc_na: 2048, red_pa: 0, ir_pa: 0 }
+    let s = Max30102Config { spo2: true,
+        averaging: 32,
+        rollover: false,
+        full_empty: 0,
+        rate_sps: 3200,
+        pulse_us: 411,
+        adc_na: 2048,
+        red_pa: 0,
+        ir_pa: 0 }
     test.assert_eq(max30102.fifo_config_of(s), 0xA0)
     // SpO2 mode, 411 us: no more than 400 sps, code 3.
     test.assert_eq(max30102.spo2_config_of(s), 0x00 | 0x0C | 3)
@@ -457,7 +473,10 @@ fn test_setup_makes_the_interrupt_pin_an_input_and_the_bus_fast() [io, hw]
     test.assert_eq(at(d.pins.modes, 9), 0)
     let noirq = Dut { bus: FakeI2c { c: c }, pins: pins(), c: c, w: dev_bus.wiring_i2c(0, 0x57) }
     test.assert(noirq.setup())
-    let spi = Dut { bus: FakeI2c { c: c }, pins: pins(), c: c, w: DeviceWiring { bus: 0, addr: None, cs: Some(3), irq: None, en: None } }
+    let spi = Dut { bus: FakeI2c { c: c },
+        pins: pins(),
+        c: c,
+        w: DeviceWiring { bus: 0, addr: None, cs: Some(3), irq: None, en: None } }
     test.assert(not spi.setup())
 
 @test
@@ -494,7 +513,7 @@ fn test_the_part_id_is_0x15_and_the_revision_comes_with_it() [io, hw]
         Some(id) =>
             test.assert_eq(id.who, 0x15)
             test.assert(id.rev == Some(0x03))
-        None => test.assert(false)
+        None     => test.assert(false)
     c.regs.insert(0xFF, 0x11)
     test.assert(not max30102.part_ok(d))
     test.assert(max30102.id_read(d) == None)
@@ -559,7 +578,7 @@ fn test_the_pointers_are_read_in_one_read_that_stops_before_fifo_data() [io, hw]
             test.assert_eq(f.wr, 7)
             test.assert_eq(f.ovf, 2)
             test.assert_eq(f.rd, 3)
-        None => test.assert(false)
+        None    => test.assert(false)
     log_is(c, [2, 0x04, 3, -1])
     c.st.insert(4, 0)
     test.assert(max30102.ptrs_read(d) == None)
@@ -616,7 +635,7 @@ fn test_the_configuration_bytes_are_read_together() [io, hw]
             test.assert_eq(b.fifo, 0x4A)
             test.assert_eq(b.mode, 0x03)
             test.assert_eq(b.spo2, 0x2F)
-        None => test.assert(false)
+        None    => test.assert(false)
     log_is(c, [2, 0x08, 3, -1])
     c.st.insert(4, 0)
     test.assert(max30102.cfg_read(d) == None)
@@ -749,7 +768,15 @@ fn test_the_samples_lost_are_the_overflow_counter() [io, hw]
 @test
 fn test_heart_rate_mode_reads_one_channel_and_ten_samples_a_burst() [io, hw]
     let c = chip()
-    let hr = Max30102Config { spo2: false, averaging: 1, rollover: false, full_empty: 8, rate_sps: 100, pulse_us: 411, adc_na: 4096, red_pa: 0x20, ir_pa: 0 }
+    let hr = Max30102Config { spo2: false,
+        averaging: 1,
+        rollover: false,
+        full_empty: 8,
+        rate_sps: 100,
+        pulse_us: 411,
+        adc_na: 4096,
+        red_pa: 0x20,
+        ir_pa: 0 }
     test.assert(max30102.start(dut(c), hr))
     log_clear(c)
     for i in 0..12
@@ -812,7 +839,7 @@ fn test_a_drain_fails_cleanly_on_any_one_failed_transaction() [io, hw]
     var out0: Vec[PpgSample; 32] = Vec.new()
     test.assert_eq(max30102.drain(dut(good), var out0), 9)
     let n = at(good.st, 1)
-    for k in 1..(n + 1)
+    for k in 1..n + 1
         let c = running()
         for i in 0..9
             fifo_push(c, i, i)
@@ -867,7 +894,15 @@ fn test_a_shorter_pulse_allows_a_faster_rate() [io, hw]
 @test
 fn test_heart_rate_mode_allows_3200_sps_at_69_us() [io, hw]
     let c = chip()
-    let hr = Max30102Config { spo2: false, averaging: 1, rollover: false, full_empty: 8, rate_sps: 100, pulse_us: 69, adc_na: 4096, red_pa: 0x20, ir_pa: 0 }
+    let hr = Max30102Config { spo2: false,
+        averaging: 1,
+        rollover: false,
+        full_empty: 8,
+        rate_sps: 100,
+        pulse_us: 69,
+        adc_na: 4096,
+        red_pa: 0x20,
+        ir_pa: 0 }
     test.assert(max30102.start(dut(c), hr))
     test.assert_eq(max30102.rate_set(dut(c), 3200), 3200)
     test.assert_eq(max30102.rate_set(dut(c), 9000), 3200)
@@ -941,7 +976,7 @@ fn test_the_temperature_fails_on_any_one_failed_transaction() [io, hw]
     c.st.insert(12, 1)
     test.assert(max30102.temperature(dut(c)) != None)
     let n = at(c.st, 1)
-    for k in 1..(n + 1)
+    for k in 1..n + 1
         let c2 = chip()
         c2.st.insert(12, 1)
         c2.st.insert(2, k)
@@ -982,7 +1017,15 @@ fn test_the_mode_is_written_last_so_sampling_starts_on_a_clean_fifo() [io, hw]
 @test
 fn test_heart_rate_mode_starts_in_mode_2() [io, hw]
     let c = chip()
-    let hr = Max30102Config { spo2: false, averaging: 2, rollover: true, full_empty: 4, rate_sps: 200, pulse_us: 215, adc_na: 8192, red_pa: 0x30, ir_pa: 0 }
+    let hr = Max30102Config { spo2: false,
+        averaging: 2,
+        rollover: true,
+        full_empty: 4,
+        rate_sps: 200,
+        pulse_us: 215,
+        adc_na: 8192,
+        red_pa: 0x30,
+        ir_pa: 0 }
     test.assert(max30102.start(dut(c), hr))
     test.assert_eq(reg_of(c, 0x09), 0x02)
     test.assert_eq(reg_of(c, 0x08), 0x20 | 0x10 | 0x04)
@@ -995,7 +1038,10 @@ fn test_start_refuses_a_part_that_is_not_a_max30102() [io, hw]
     let c2 = chip()
     c2.st.insert(4, 0)
     test.assert(not max30102.start(dut(c2), max30102.config_default()))
-    let spi = Dut { bus: FakeI2c { c: chip() }, pins: pins(), c: chip(), w: DeviceWiring { bus: 0, addr: None, cs: Some(3), irq: None, en: None } }
+    let spi = Dut { bus: FakeI2c { c: chip() },
+        pins: pins(),
+        c: chip(),
+        w: DeviceWiring { bus: 0, addr: None, cs: Some(3), irq: None, en: None } }
     test.assert(not max30102.start(spi, max30102.config_default()))
 
 @test
@@ -1004,7 +1050,7 @@ fn test_start_fails_on_any_one_failed_transaction() [io, hw]
     c.st.insert(10, 2)
     test.assert(max30102.start(dut(c), max30102.config_default()))
     let n = at(c.st, 1)
-    for k in 1..(n + 1)
+    for k in 1..n + 1
         let c2 = chip()
         c2.st.insert(10, 2)
         c2.st.insert(2, k)

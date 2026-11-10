@@ -77,38 +77,38 @@ use dev_ppg.{ PpgSample, PpgLed, HeartRate }
 use dev_id.{ DeviceId, Identifiable }
 
 // The registers.
-let INT_STATUS_1 = 0x00
-let INT_ENABLE_1 = 0x02
-let FIFO_WR_PTR = 0x04
-let FIFO_DATA = 0x07
-let FIFO_CONFIG = 0x08
-let MODE_CONFIG = 0x09
-let SPO2_CONFIG = 0x0A
-let LED1_PA = 0x0C
-let LED2_PA = 0x0D
-let DIE_TEMP_INT = 0x1F
+let INT_STATUS_1    = 0x00
+let INT_ENABLE_1    = 0x02
+let FIFO_WR_PTR     = 0x04
+let FIFO_DATA       = 0x07
+let FIFO_CONFIG     = 0x08
+let MODE_CONFIG     = 0x09
+let SPO2_CONFIG     = 0x0A
+let LED1_PA         = 0x0C
+let LED2_PA         = 0x0D
+let DIE_TEMP_INT    = 0x1F
 let DIE_TEMP_CONFIG = 0x21
-let REV_ID = 0xFE
-let PART_ID = 0xFF
+let REV_ID          = 0xFE
+let PART_ID         = 0xFF
 
 // PART_ID's value.
 let ID_MAX30102 = 0x15
 
 // MODE_CONFIG: shutdown, reset, and the modes.
-let MODE_SHDN = 0x80
+let MODE_SHDN  = 0x80
 let MODE_RESET = 0x40
-let MODE_HR = 0x02
-let MODE_SPO2 = 0x03
+let MODE_HR    = 0x02
+let MODE_SPO2  = 0x03
 
 // FIFO_CONFIG: roll-over.
 let FIFO_ROLLOVER = 0x10
 
 // Interrupt bits: INT_STATUS_1 / INT_ENABLE_1 and the second register,
 // which `int_status` puts in the low byte.
-let INT_A_FULL = 0x8000
-let INT_PPG_RDY = 0x4000
-let INT_ALC_OVF = 0x2000
-let INT_PWR_RDY = 0x0100
+let INT_A_FULL   = 0x8000
+let INT_PPG_RDY  = 0x4000
+let INT_ALC_OVF  = 0x2000
+let INT_PWR_RDY  = 0x0100
 let INT_DIE_TEMP = 0x0002
 
 // The FIFO holds 32 samples.
@@ -117,13 +117,13 @@ let FIFO_DEPTH = 32
 // The bus clock, I2C fast mode, and how long the driver waits: for the
 // reset bit and for a temperature conversion (the sheet's Figure 4 shows
 // 29 ms), in milliseconds.
-let I2C_HZ = 400000
+let I2C_HZ        = 400000
 let RESET_WAIT_MS = 100
-let TEMP_WAIT_MS = 100
+let TEMP_WAIT_MS  = 100
 
 // The LED current is 0.2 mA a step, 0xFF being 51.0 mA (Table 8).
 let LED_STEP_TENTHS_MA = 2
-let LED_CODE_MAX = 255
+let LED_CODE_MAX       = 255
 
 // A beat detector's sample is the infrared count when there is one.
 let SAMPLE_BYTES = 3
@@ -312,7 +312,15 @@ struct Max30102Config
 // the overflow counter, the interrupt with 10 slots left (22 unread), the
 // 411 us pulse (18 bits), 4096 nA full scale and about 6 mA in both LEDs.
 pub fn config_default() -> Max30102Config
-    Max30102Config { spo2: true, averaging: 4, rollover: false, full_empty: 10, rate_sps: 400, pulse_us: 411, adc_na: 4096, red_pa: 0x1F, ir_pa: 0x1F }
+    Max30102Config { spo2: true,
+        averaging: 4,
+        rollover: false,
+        full_empty: 10,
+        rate_sps: 400,
+        pulse_us: 411,
+        adc_na: 4096,
+        red_pa: 0x1F,
+        ir_pa: 0x1F }
 
 // The FIFO_CONFIG byte for a configuration.
 pub fn fifo_config_of(c: Max30102Config) -> Int
@@ -450,7 +458,7 @@ pub fn ptrs_read<P: Max30102Port>(p: P) -> ?FifoPtrs [hw]
     var b: DevBytes = Vec.new()
     if not p.read_regs(FIFO_WR_PTR, 3, var b)
         return None
-    Some(FifoPtrs { wr: (b[0] as Int) & 0x1F, ovf: (b[1] as Int) & 0x1F, rd: (b[2] as Int) & 0x1F })
+    Some(FifoPtrs { wr: b[0] as Int & 0x1F, ovf: b[1] as Int & 0x1F, rd: b[2] as Int & 0x1F })
 
 // The samples waiting: the pointers' difference modulo 32.  When the
 // pointers meet, the FIFO is empty unless samples were lost, in which case
@@ -527,7 +535,10 @@ pub fn fifo_read<P: Max30102Port>(p: P, n: Int, ch: Int, pw: Int, period_us: Int
                 var ir = 0
                 if ch == 2
                     ir = count_of_bytes(b[base + 3] as Int, b[base + 4] as Int, b[base + 5] as Int, pw)
-                let _ = out.push(PpgSample { red: red, ir: ir, green: None, at_us: last_us - (n - 1 - (done + s)) * period_us })
+                let _ = out.push(PpgSample { red: red,
+                    ir: ir,
+                    green: None,
+                    at_us: last_us - (n - 1 - (done + s)) * period_us })
             done = done + take
     done
 
@@ -574,9 +585,12 @@ pub fn lost<P: Max30102Port>(p: P) -> Int [hw]
 pub fn led_set<P: Max30102Port>(p: P, led: PpgLed, ma: Int) -> Int [hw]
     var reg = LED1_PA
     match led
-        PpgLed.PpgRed => reg = LED1_PA
-        PpgLed.PpgIr => reg = LED2_PA
-        PpgLed.PpgGreen => return 0
+        PpgLed.PpgRed   =>
+            reg = LED1_PA
+        PpgLed.PpgIr    =>
+            reg = LED2_PA
+        PpgLed.PpgGreen =>
+            return 0
     let code = led_code_of_ma(ma)
     if not wr(p, reg, code)
         return 0
@@ -615,7 +629,7 @@ pub fn int_status<P: Max30102Port>(p: P) -> Int [hw]
     var b: DevBytes = Vec.new()
     if not p.read_regs(INT_STATUS_1, 2, var b)
         return -1
-    ((b[0] as Int) << 8) | (b[1] as Int)
+    (b[0] as Int << 8) | b[1] as Int
 
 // ── The temperature ──────────────────────────────────────────────────
 

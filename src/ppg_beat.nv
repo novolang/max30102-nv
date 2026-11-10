@@ -72,7 +72,20 @@ struct Beat
 
 // A detector that has seen no sample: not primed, no interval, no rate.
 pub fn beat_new() -> Beat
-    Beat { primed: false, dc: 0, lp: 0, amp: 0, armed: false, since: 0, n: 0, i0: 0, i1: 0, i2: 0, i3: 0, bpm: 0, beats: 0, fresh: false }
+    Beat { primed: false,
+        dc: 0,
+        lp: 0,
+        amp: 0,
+        armed: false,
+        since: 0,
+        n: 0,
+        i0: 0,
+        i1: 0,
+        i2: 0,
+        i3: 0,
+        bpm: 0,
+        beats: 0,
+        fresh: false }
 
 // The intervals the detector keeps, in beats a minute.
 pub fn bpm_min() -> Int
@@ -93,7 +106,20 @@ pub fn bpm_of(sum: Int, n: Int, fs: Int) -> Int
 // The detector after one sample.
 pub fn beat_feed(d: Beat, x: Int, c: BeatConfig) -> Beat
     if x < c.min_signal
-        return Beat { primed: false, dc: 0, lp: 0, amp: 0, armed: false, since: 0, n: 0, i0: 0, i1: 0, i2: 0, i3: 0, bpm: 0, beats: d.beats, fresh: false }
+        return Beat { primed: false,
+            dc: 0,
+            lp: 0,
+            amp: 0,
+            armed: false,
+            since: 0,
+            n: 0,
+            i0: 0,
+            i1: 0,
+            i2: 0,
+            i3: 0,
+            bpm: 0,
+            beats: d.beats,
+            fresh: false }
     var dc = x * 256
     if d.primed
         dc = d.dc + (x * 256 - d.dc) / (c.fs_hz * 3 / 2)
@@ -139,7 +165,20 @@ pub fn beat_feed(d: Beat, x: Int, c: BeatConfig) -> Beat
     if since > c.fs_hz * 3
         n = 0
         bpm = 0
-    Beat { primed: true, dc: dc, lp: lp, amp: amp, armed: armed, since: since, n: n, i0: i0, i1: i1, i2: i2, i3: i3, bpm: bpm, beats: beats, fresh: fresh }
+    Beat { primed: true,
+        dc: dc,
+        lp: lp,
+        amp: amp,
+        armed: armed,
+        since: since,
+        n: n,
+        i0: i0,
+        i1: i1,
+        i2: i2,
+        i3: i3,
+        bpm: bpm,
+        beats: beats,
+        fresh: fresh }
 
 // The count the detector reads from a sample: the infrared count, or the
 // red one for a part in heart rate mode, which has no infrared.
