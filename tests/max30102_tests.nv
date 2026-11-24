@@ -22,7 +22,7 @@
 
 use std.test
 use embedded_hal.{ BoardI2c, BoardGpio, BoardTimer, I2cBus, GpioOut }
-use dev_bus.{ DeviceWiring, DevBytes }
+use dev_bus.{ DeviceWiring, DevBytes, RegPort }
 use dev_ppg.{ PpgSample, PpgLed, HeartRate }
 use dev_id.{ DeviceId, Identifiable }
 use max30102
@@ -228,15 +228,21 @@ struct Dut
     c: Chip
     w: DeviceWiring
 
-impl Max30102Port for Dut
-    fn setup(self) -> Bool [hw]
-        max30102.i2c_setup(self.bus, self.pins, self.w)
-
+impl RegPort for Dut
     fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
         max30102.i2c_read_into(self.bus, self.w, reg, n, var dst)
 
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        var src: DevBytes = Vec.new()
+        let _ = src.push((v & 0xFF) as u8)
+        max30102.i2c_write_from(self.bus, self.w, reg, src)
+
     fn write_regs(self, reg: Int, src: DevBytes) -> Bool [hw]
         max30102.i2c_write_from(self.bus, self.w, reg, src)
+
+impl Max30102Port for Dut
+    fn setup(self) -> Bool [hw]
+        max30102.i2c_setup(self.bus, self.pins, self.w)
 
     fn now_us(self) -> Int [hw]
         at(self.c.st, 0)
@@ -493,14 +499,14 @@ fn test_the_interrupt_level_follows_the_wiring() [io, hw]
 fn test_register_access() [io, hw]
     let c = chip()
     let d = dut(c)
-    test.assert(max30102.wr(d, 0x30, 0x1AB))
-    test.assert(max30102.rd(d, 0x30) == Some(0xAB))
-    test.assert(max30102.upd(d, 0x30, 0x0F, 0x03))
+    test.assert(d.write_reg(0x30, 0x1AB))
+    test.assert(d.read_reg(0x30) == Some(0xAB))
+    test.assert(d.update_reg(0x30, 0x0F, 0x03))
     test.assert_eq(reg_of(c, 0x30), 0xA3)
     c.st.insert(4, 0)
-    test.assert(max30102.rd(d, 0x30) == None)
-    test.assert(not max30102.wr(d, 0x30, 1))
-    test.assert(not max30102.upd(d, 0x30, 1, 1))
+    test.assert(d.read_reg(0x30) == None)
+    test.assert(not d.write_reg(0x30, 1))
+    test.assert(not d.update_reg(0x30, 1, 1))
 
 // ── Identity, reset and shutdown ─────────────────────────────────────
 
@@ -1094,5 +1100,15 @@ fn test_the_type_over_absent_hardware() [io, hw]
 fn test_the_almost_full_level_changes_only_its_own_bits() [io, hw]
     let c = running()
     let d = dut(c)
-    test.assert(max30102.upd(d, 0x08, 0x0F, 3))
+    test.assert(d.update_reg(0x08, 0x0F, 3))
     test.assert_eq(reg_of(c, 0x08), 0x43)
+
+// ── The functions that the register methods replace ──────────────────
+
+@test
+fn test_the_deprecated_register_functions_answer_as_the_methods_do() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert_eq(max30102.rd(d, 0x30), d.read_reg(0x30))
+    test.assert_eq(max30102.wr(d, 0x30, 0x01), d.write_reg(0x30, 0x01))
+    test.assert_eq(max30102.upd(d, 0x30, 0x0F, 0x01), d.update_reg(0x30, 0x0F, 0x01))

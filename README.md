@@ -204,7 +204,7 @@ are therefore not on the same scale.
 
 | Module | What is in it |
 |---|---|
-| `max30102` | The type `Max30102` that holds a board's bus, timer and pins, the trait `Max30102Port`, the configuration `Max30102Config`, the register conversions, the FIFO drain, the temperature and the bring-up |
+| `max30102` | The type `Max30102` that holds a board's bus, timer and pins, the trait `Max30102Port` over devices-nv's `RegPort`, the configuration `Max30102Config`, the register conversions, the FIFO drain, the temperature and the bring-up |
 | `ppg_beat` | The beat detector `Beat` with `beat_feed` for one count and `beat_run` for a `HeartRate` |
 
 ## How to choose an entry point
@@ -230,7 +230,7 @@ function written against `HeartRate` can call them on a `let`.
 | `reg(r)`, `set_reg(r, v)` | one register |
 
 A program that holds its own bus, or a test with a double of the part,
-implements `Max30102Port` over its bus and calls the module's functions,
+implements devices-nv's `RegPort` (`read_regs` and `write_reg`; the register reads and read-modify-writes, `port.read_reg(reg)` and `port.update_reg_verified(reg, mask, bits)`, are its methods) and `Max30102Port` over its bus and calls the module's functions,
 which take the port: `max30102.start(port, config)`,
 `max30102.drain(port, var out)`.
 

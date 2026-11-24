@@ -1,6 +1,6 @@
 [package]
 name        = "max30102-nv"
-version     = "0.1.1"
+version     = "0.2.0"
 description = "A driver for the Maxim (Analog Devices) MAX30102 pulse oximeter and heart-rate sensor on an I2C bus: the part ID check and reset, the FIFO with its pointers, overflow counter, averaging, roll-over and almost-full interrupt, the heart-rate and SpO2 modes, the LED pulse amplitudes, pulse width and ADC range, the die temperature, the raw red and infrared counts, and a beat detector over the infrared channel, as devices-nv's HeartRate and Identifiable."
 license     = "Apache-2.0"
 stability   = "experimental"
@@ -25,4 +25,4 @@ tier = "embedded"
 embedded-hal-nv = "^0.4.0"
 # The HeartRate and Identifiable traits, the wiring record a board's
 # device table hands `attach`, and the register helpers.
-devices-nv      = "^0.4.0"
+devices-nv      = "^0.4.1"
